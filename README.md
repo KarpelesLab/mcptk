@@ -412,9 +412,13 @@ Run one with `cargo run --example echo`.
 | `ws` | no | the `ws` module: WebSocket server transport (`tokio-tungstenite`) |
 | `schemars` | yes | `typed_tool` and `Tool::output_schema_for`, with schemas derived from types |
 
-## Not yet supported
+## Left out on purpose
 
-- Resuming HTTP streams with `Last-Event-ID`
+- Resuming HTTP streams with `Last-Event-ID`: optional in the handshake
+  revisions, and removed from the protocol in 2026-07-28.
+- The experimental tasks of 2025-11-25, superseded by the
+  [tasks extension](#tasks).
+- The legacy HTTP+SSE transport, deprecated since 2025-03-26.
 
 ## License
 

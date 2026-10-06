@@ -402,6 +402,9 @@ where
 {
     let period = keepalive.unwrap_or(Duration::from_secs(3600));
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    // With keepalive pings, a live client is heard from (a pong at least)
+    // every period: one silent for three is gone.
+    let mut last_heard = tokio::time::Instant::now();
     loop {
         tokio::select! {
             biased;
@@ -418,7 +421,7 @@ where
                 }
                 return close(ws, None).await;
             }
-            frame = ws.next() => match frame {
+            frame = ws.next() => { last_heard = tokio::time::Instant::now(); match frame {
                 None => return Ok(()),
                 Some(Ok(WsMessage::Text(text))) => dispatch(text.as_bytes(), session, outlet, &identity),
                 // Lenient: some clients send JSON in binary frames.
@@ -432,8 +435,12 @@ where
                     return close(ws, Some(frame)).await;
                 }
                 Some(Err(e)) => return Err(ws_error(e)),
-            },
+            }},
             _ = tick.tick(), if keepalive.is_some() => {
+                if last_heard.elapsed() > period * 3 {
+                    tracing::debug!("WebSocket client unresponsive, closing");
+                    return Err(Error::Other("WebSocket client stopped responding".into()));
+                }
                 ws.send(WsMessage::Ping(Bytes::new())).await.map_err(ws_error)?;
             }
         }

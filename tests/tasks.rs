@@ -567,3 +567,13 @@ async fn status_notifications_on_listen_streams() {
     assert_eq!(p["_meta"]["io.modelcontextprotocol/subscriptionId"], "watch");
     assert!(p.get("owner").is_none());
 }
+
+#[tokio::test]
+async fn replacing_a_task_tool_with_a_plain_one() {
+    let f = fixture(TaskConfig::new());
+    let mut c = Client::connect(&f.server).await;
+    f.server.add_tool(Tool::new("quick", "Now a plain tool"), |_ctx, _args| async move { Ok::<_, ToolError>("plain") });
+    let res = c.call("tools/call", json!({"name": "quick", "arguments": {}})).await;
+    assert_eq!(res["result"]["resultType"], "complete", "{res}");
+    assert_eq!(res["result"]["content"][0]["text"], "plain");
+}

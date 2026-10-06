@@ -899,8 +899,10 @@ impl Server {
         Fut: Future<Output = Result<R, ToolError>> + Send + 'static,
         R: IntoToolResult,
     {
-        self.tasks_or_panic().modes.write().unwrap().insert(tool.name.clone(), TaskMode::Optional);
+        let name = tool.name.clone();
+        // In this order: adding a tool clears its task mode.
         self.add_tool(tool, as_tool_handler(task_tool_fn(handler)));
+        self.tasks_or_panic().modes.write().unwrap().insert(name, TaskMode::Optional);
     }
 
     /// Set when calls of the tool `name` become tasks. Only for tools added
@@ -915,10 +917,14 @@ impl Server {
 
     /// Remove a task tool. Returns whether it existed.
     pub fn remove_task_tool(&self, name: &str) -> bool {
+        self.remove_tool(name)
+    }
+
+    /// The tool `name` was replaced or removed: it is no longer a task tool.
+    pub(crate) fn forget_task_tool(&self, name: &str) {
         if let Some(m) = &self.inner.config.tasks {
             m.modes.write().unwrap().remove(name);
         }
-        self.remove_tool(name)
     }
 
     /// A task's current state, if it exists and hasn't expired.

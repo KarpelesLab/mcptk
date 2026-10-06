@@ -207,6 +207,7 @@ impl Server {
     }
 
     fn insert_tool(&self, entry: ToolEntry) {
+        self.forget_task_tool(&entry.tool.name);
         upsert(&self.inner.tools, entry, |e| &e.tool.name);
         self.broadcast("notifications/tools/list_changed");
     }
@@ -214,6 +215,7 @@ impl Server {
     /// Remove a tool. Returns whether it existed.
     pub fn remove_tool(&self, name: &str) -> bool {
         let removed = remove(&self.inner.tools, |e| e.tool.name == name);
+        self.forget_task_tool(name);
         if removed {
             self.broadcast("notifications/tools/list_changed");
         }
