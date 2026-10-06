@@ -29,6 +29,7 @@
 //! ```
 
 pub mod apps;
+pub mod auth;
 pub mod channel;
 mod error;
 #[cfg(feature = "http")]

@@ -386,6 +386,7 @@ impl Session {
                     meta,
                     outlet: reply.clone(),
                     cancel: cancel.clone(),
+                    auth: crate::auth::current(), // auth hook
                 };
                 let session = self.clone();
                 let reply = reply.clone();
@@ -502,6 +503,8 @@ pub struct RequestContext {
     meta: Option<JsonObject>,
     outlet: Outlet,
     cancel: CancellationToken,
+    /// Who the request is authenticated as (see `crate::auth`).
+    pub(crate) auth: Option<Arc<crate::auth::AuthInfo>>,
 }
 
 impl RequestContext {

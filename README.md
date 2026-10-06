@@ -17,9 +17,10 @@ another MCP SDK.
 - **Requests to the client**: sampling, elicitation, roots, ping.
 - **Transports**: stdio, any `AsyncRead`/`AsyncWrite` pair (unix sockets,
   pipes...), and Streamable HTTP (sessions, SSE or JSON responses, `GET`
-  streams, origin checks, idle expiry). The HTTP handler can also be mounted
-  in your own hyper/axum server. WebSocket (`ws` feature) for Claude Code's
-  `"type": "ws"` servers, optionally on the same port and path as HTTP.
+  streams, origin checks, idle expiry, OAuth authorization). The HTTP handler
+  can also be mounted in your own hyper/axum server. WebSocket (`ws` feature)
+  for Claude Code's `"type": "ws"` servers, optionally on the same port and
+  path as HTTP.
 - **Channels**: push events into a Claude Code session, and relay its
   permission prompts.
 - **MCP Apps**: serve interactive HTML views for tool results
@@ -127,6 +128,60 @@ Mount it in your own hyper/axum server with `WebSocketServer::handle(request)`
 (the connection must be served `with_upgrades()`), or serve an already
 upgraded `WebSocketStream` with `Server::connect_ws`. Authentication is up to
 you: check the request's headers before handing it over.
+
+### Authorization (OAuth)
+
+A Streamable HTTP server can require OAuth access tokens, following the MCP
+authorization spec: the server is an OAuth 2.1 *resource server*, and your
+identity provider is the authorization server that issues tokens.
+
+```rust
+use mcptk::auth::{AuthError, AuthInfo, ProtectedResource, validator_fn};
+
+let validator = validator_fn(|token: String| async move {
+    // Verify the JWT (or introspect the token) with the library of your
+    // choice. Check its audience is this server's resource URL!
+    let claims = verify(&token).map_err(|e| AuthError::invalid_token(e.to_string()))?;
+    Ok(AuthInfo::new(claims.sub).scopes(claims.scopes))
+});
+
+StreamableHttp::new(server)
+    .auth(
+        ProtectedResource::new("https://mcp.example.com/mcp", validator)
+            .authorization_server("https://auth.example.com")
+            .scopes_supported(["notes:read"])
+            .require_scopes(["notes:read"])        // every request
+            .tool_scopes("add_note", ["notes:write"]), // step-up for one tool
+    )
+    .serve("127.0.0.1:8080")
+    .await?;
+```
+
+With that, mcptk:
+
+- serves the Protected Resource Metadata (RFC 9728) at
+  `/.well-known/oauth-protected-resource/mcp` and
+  `/.well-known/oauth-protected-resource`, which is how clients such as
+  Claude Code find where to log in;
+- answers requests with no valid `Authorization: Bearer` token with `401`
+  and `WWW-Authenticate: Bearer resource_metadata="...", scope="..."`;
+- answers tokens lacking scopes with `403` and
+  `error="insufficient_scope"`, naming the scopes needed, so the client can
+  re-authorize with more (tool scopes are checked before the tool runs);
+- gives handlers the caller's identity, per request: `ctx.auth()` returns
+  the `AuthInfo` (subject, scopes, client id, expiry, extra claims), and
+  `ctx.require_scope("x")?` checks a scope inside a handler;
+- binds each session to the subject that created it: another user's token
+  can't use it.
+
+mcptk ships no JWT or crypto code: implement `TokenValidator` (or use
+`validator_fn`). The validator must reject tokens not issued for this server
+(audience) and expired ones. Never pass the client's token on to other APIs.
+`StaticTokens` maps fixed tokens to identities for tests and development.
+
+When mounting `handle` in your own router, route the paths from
+`ProtectedResource::metadata_paths()` to it too (it answers them whatever
+`.path` is), or serve `ProtectedResource::metadata_response()` yourself.
 
 ## Channels
 

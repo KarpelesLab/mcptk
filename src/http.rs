@@ -100,6 +100,7 @@ struct Settings {
     max_body_size: usize,
     session_timeout: Duration,
     keepalive: Duration,
+    auth: Option<Arc<crate::auth::ProtectedResource>>,
 }
 
 #[derive(Default)]
@@ -134,6 +135,7 @@ impl StreamableHttp {
                 max_body_size: 4 << 20,
                 session_timeout: Duration::from_secs(3600),
                 keepalive: Duration::from_secs(25),
+                auth: None,
             }),
             state: Arc::default(),
         }
@@ -193,6 +195,21 @@ impl StreamableHttp {
         self
     }
 
+    /// Require OAuth access tokens, and serve the protected resource
+    /// metadata. See [`crate::auth`].
+    pub fn auth(mut self, resource: crate::auth::ProtectedResource) -> Self {
+        if resource.authorization_servers().is_empty() {
+            tracing::warn!("ProtectedResource has no authorization server: clients can't log in");
+        }
+        self.settings().auth = Some(Arc::new(resource));
+        self
+    }
+
+    /// The authorization settings, if any.
+    pub fn protected_resource(&self) -> Option<&crate::auth::ProtectedResource> {
+        self.settings.auth.as_deref()
+    }
+
     pub fn server(&self) -> &Server {
         &self.server
     }
@@ -229,11 +246,21 @@ impl StreamableHttp {
     }
 
     /// Handle one HTTP request.
-    pub async fn handle<B>(&self, req: Request<B>) -> Response<McpBody>
+    ///
+    /// With [`auth`](Self::auth), this also answers requests for the
+    /// protected resource metadata, on its well-known paths, whatever
+    /// [`path`](Self::path) is.
+    pub async fn handle<B>(&self, mut req: Request<B>) -> Response<McpBody>
     where
         B: Body,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        // auth hook: metadata document
+        if let Some(auth) = &self.settings.auth
+            && let Some(res) = auth.serve_metadata(&req)
+        {
+            return res;
+        }
         if let Some(path) = &self.settings.path
             && req.uri().path() != path
         {
@@ -241,6 +268,13 @@ impl StreamableHttp {
         }
         if !self.origin_allowed(req.headers().get(header::ORIGIN)) {
             return rpc_error(StatusCode::FORBIDDEN, "Forbidden: origin not allowed");
+        }
+        // auth hook: bearer token
+        if let Some(auth) = &self.settings.auth {
+            match auth.authenticate(req.headers()).await {
+                Ok(info) => req.extensions_mut().insert(info),
+                Err(res) => return res,
+            };
         }
         if let Some(v) = req.headers().get(PROTOCOL_VERSION_HEADER)
             && !SUPPORTED_PROTOCOL_VERSIONS.iter().any(|s| v.as_bytes() == s.as_bytes())
@@ -280,7 +314,8 @@ impl StreamableHttp {
         };
         let session = self.state.sessions.lock().unwrap().get(id).cloned();
         match session {
-            Some(s) if !s.session.is_closed() => {
+            // auth hook: only the subject that created a session may use it
+            Some(s) if !s.session.is_closed() && crate::auth::owns_session(&s.session, req.extensions()) => {
                 s.touch();
                 Ok(s)
             }
@@ -330,13 +365,22 @@ impl StreamableHttp {
                 Err(error) => return json_body(StatusCode::BAD_REQUEST, &error, None),
             }
         }
+        // auth hook: scopes needed by these requests
+        if let Some(auth) = &self.settings.auth
+            && let Err(res) = auth.check_scopes(&messages, &parts.extensions)
+        {
+            return res;
+        }
+        let auth = crate::auth::from_extensions(&parts.extensions);
 
         let initializing = messages.iter().any(|m| matches!(m, Message::Request(r) if r.method == "initialize"));
         let session = if initializing {
             if messages.len() > 1 {
                 return rpc_error(StatusCode::BAD_REQUEST, "Bad Request: initialize must be sent alone");
             }
-            self.create_session()
+            let session = self.create_session();
+            crate::auth::bind_session(&session.session, &parts.extensions); // auth hook
+            session
         } else {
             match self.lookup(&Request::from_parts(parts, ())) {
                 Ok(s) => s,
@@ -347,12 +391,14 @@ impl StreamableHttp {
 
         let mailbox = Outlet::Mailbox(session.mailbox.clone());
         let mut requests = Vec::new();
-        for m in messages {
-            match m {
-                Message::Request(r) => requests.push(r),
-                other => session.session.handle(other, &mailbox),
+        crate::auth::scope(auth.clone(), || {
+            for m in messages {
+                match m {
+                    Message::Request(r) => requests.push(r),
+                    other => session.session.handle(other, &mailbox),
+                }
             }
-        }
+        });
         if requests.is_empty() {
             return empty(StatusCode::ACCEPTED);
         }
@@ -360,9 +406,11 @@ impl StreamableHttp {
         let (tx, rx) = mpsc::unbounded_channel();
         let outlet = Outlet::Channel(tx);
         let pending: HashSet<RequestId> = requests.iter().map(|r| r.id.clone()).collect();
-        for r in requests {
-            session.session.handle(Message::Request(r), &outlet);
-        }
+        crate::auth::scope(auth, || {
+            for r in requests {
+                session.session.handle(Message::Request(r), &outlet);
+            }
+        });
         drop(outlet);
 
         if use_sse {
@@ -561,7 +609,7 @@ impl Body for McpBody {
 }
 
 impl McpBody {
-    fn full(data: impl Into<Bytes>) -> Self {
+    pub(crate) fn full(data: impl Into<Bytes>) -> Self {
         McpBody(BodyKind::Full(Some(data.into())))
     }
 
