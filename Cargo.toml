@@ -1,0 +1,51 @@
+[package]
+name = "mcptk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "MCP Toolkit: build Model Context Protocol servers over stdio, Streamable HTTP and more, with support for newer features such as Claude Code channels."
+repository = "https://github.com/KarpelesLab/mcptk"
+readme = "README.md"
+keywords = ["mcp", "ai", "agent", "jsonrpc", "llm"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = ["stdio", "http", "schemars"]
+# Serve over stdin/stdout (and any AsyncRead/AsyncWrite pair).
+stdio = ["tokio/io-std"]
+# Streamable HTTP server transport.
+http = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:http", "dep:bytes", "tokio/net"]
+# Derive tool input/output schemas from Rust types.
+schemars = ["dep:schemars"]
+
+[dependencies]
+tokio = { version = "1.44", features = ["rt", "macros", "sync", "time", "io-util"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+getrandom = "0.3"
+schemars = { version = "1", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+http = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "io-std", "net"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[[example]]
+name = "echo"
+required-features = ["stdio", "schemars"]
+
+[[example]]
+name = "webhook_channel"
+required-features = ["stdio", "http"]
+
+[[example]]
+name = "http_server"
+required-features = ["http", "schemars"]
