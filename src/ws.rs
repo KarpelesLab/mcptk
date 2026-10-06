@@ -77,6 +77,15 @@ pub struct WebSocketServer {
     settings: Arc<Settings>,
     #[cfg(feature = "http")]
     http: Option<crate::http::StreamableHttp>,
+    #[cfg(feature = "http")]
+    auth: Option<Arc<crate::auth::ProtectedResource>>,
+}
+
+/// Who a connection was authenticated as, if the server requires it.
+#[derive(Clone, Default)]
+struct Identity {
+    #[cfg(feature = "http")]
+    auth: Option<(Arc<crate::auth::ProtectedResource>, Arc<crate::auth::AuthInfo>)>,
 }
 
 impl WebSocketServer {
@@ -92,6 +101,8 @@ impl WebSocketServer {
             }),
             #[cfg(feature = "http")]
             http: None,
+            #[cfg(feature = "http")]
+            auth: None,
         }
     }
 
@@ -142,6 +153,26 @@ impl WebSocketServer {
     #[cfg(feature = "http")]
     pub fn with_http(mut self, http: crate::http::StreamableHttp) -> Self {
         self.http = Some(http);
+        self
+    }
+
+    /// Require an OAuth access token to connect, as
+    /// [`StreamableHttp::auth`](crate::http::StreamableHttp::auth) does.
+    ///
+    /// The token comes in the upgrade request's `Authorization: Bearer`
+    /// header (Claude Code sends the server's configured `headers`); without
+    /// a valid one the upgrade is refused with `401` and a
+    /// `WWW-Authenticate` challenge, or `403` if it lacks the scopes every
+    /// request needs. Handlers then see the identity with `ctx.auth()`.
+    /// A request needing more scopes (tool or method scopes) gets a
+    /// JSON-RPC error, and the connection is closed once the token expires.
+    ///
+    /// The Protected Resource Metadata is served here too, unless
+    /// [`with_http`](Self::with_http) hands those requests to a
+    /// `StreamableHttp` (give it the same `auth`).
+    #[cfg(feature = "http")]
+    pub fn auth(mut self, resource: crate::auth::ProtectedResource) -> Self {
+        self.auth = Some(Arc::new(resource));
         self
     }
 
@@ -200,6 +231,12 @@ impl WebSocketServer {
             if let Some(http) = &self.http {
                 return http.handle(req).await.map(|b| WsBody(BodyKind::Http(b)));
             }
+            #[cfg(feature = "http")]
+            if let Some(auth) = &self.auth
+                && let Some(res) = auth.serve_metadata(&req)
+            {
+                return res.map(|b| WsBody(BodyKind::Http(b)));
+            }
             if !on_path {
                 return plain(StatusCode::NOT_FOUND, "not found");
             }
@@ -208,13 +245,22 @@ impl WebSocketServer {
             res.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
             return res;
         }
-        self.upgrade(req)
-    }
-
-    fn upgrade<B>(&self, mut req: Request<B>) -> Response<WsBody> {
         if !origin_allowed(&self.settings, req.headers().get(header::ORIGIN)) {
             return plain(StatusCode::FORBIDDEN, "Forbidden: origin not allowed");
         }
+        #[allow(unused_mut)]
+        let mut identity = Identity::default();
+        #[cfg(feature = "http")]
+        if let Some(auth) = &self.auth {
+            match auth.authenticate_connection(req.headers()).await {
+                Ok(info) => identity.auth = Some((auth.clone(), info)),
+                Err(res) => return res.map(|b| WsBody(BodyKind::Http(b))),
+            }
+        }
+        self.upgrade(req, identity)
+    }
+
+    fn upgrade<B>(&self, mut req: Request<B>, identity: Identity) -> Response<WsBody> {
         let headers = req.headers();
         if headers.get(header::SEC_WEBSOCKET_VERSION).is_none_or(|v| v.as_bytes() != b"13") {
             let mut res = plain(StatusCode::UPGRADE_REQUIRED, "unsupported WebSocket version");
@@ -243,7 +289,7 @@ impl WebSocketServer {
             };
             let io = hyper_util::rt::TokioIo::new(upgraded);
             let ws = WebSocketStream::from_raw_socket(io, Role::Server, Some(config(settings.max_message_size))).await;
-            if let Err(e) = connect(&server, ws, settings.keepalive).wait().await {
+            if let Err(e) = connect(&server, ws, settings.keepalive, identity).wait().await {
                 tracing::debug!("WebSocket session ended with an error: {e}");
             }
         });
@@ -314,7 +360,7 @@ impl Server {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        connect(self, ws, None)
+        connect(self, ws, None, Identity::default())
     }
 
     /// Serve one session over an already upgraded WebSocket until it ends.
@@ -326,7 +372,7 @@ impl Server {
     }
 }
 
-fn connect<S>(server: &Server, ws: WebSocketStream<S>, keepalive: Option<Duration>) -> Connection
+fn connect<S>(server: &Server, ws: WebSocketStream<S>, keepalive: Option<Duration>, identity: Identity) -> Connection
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -335,7 +381,7 @@ where
     let session = Session::new(server.clone(), outlet.clone());
     let s = session.clone();
     let task = tokio::spawn(async move {
-        let result = run(ws, &s, &outlet, rx, keepalive).await;
+        let result = run(ws, &s, &outlet, rx, keepalive, identity).await;
         s.close();
         result
     });
@@ -348,6 +394,7 @@ async fn run<S>(
     outlet: &Outlet,
     mut rx: mpsc::UnboundedReceiver<Outbound>,
     keepalive: Option<Duration>,
+    identity: Identity,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -372,9 +419,9 @@ where
             }
             frame = ws.next() => match frame {
                 None => return Ok(()),
-                Some(Ok(WsMessage::Text(text))) => dispatch(text.as_bytes(), session, outlet),
+                Some(Ok(WsMessage::Text(text))) => dispatch(text.as_bytes(), session, outlet, &identity),
                 // Lenient: some clients send JSON in binary frames.
-                Some(Ok(WsMessage::Binary(data))) => dispatch(&data, session, outlet),
+                Some(Ok(WsMessage::Binary(data))) => dispatch(&data, session, outlet, &identity),
                 // tungstenite answers pings, and replies to a close frame on
                 // the next poll, after which the stream ends.
                 Some(Ok(_)) => {}
@@ -392,12 +439,32 @@ where
     }
 }
 
-fn dispatch(text: &[u8], session: &Session, outlet: &Outlet) {
+fn dispatch(text: &[u8], session: &Session, outlet: &Outlet, identity: &Identity) {
     if text.iter().all(u8::is_ascii_whitespace) {
         return;
     }
+    #[cfg(not(feature = "http"))]
+    let _ = identity;
     for msg in jsonrpc::decode(text) {
         match msg {
+            #[cfg(feature = "http")]
+            Ok(msg) if identity.auth.is_some() => {
+                let Some((resource, info)) = &identity.auth else { unreachable!() };
+                if info.is_expired() {
+                    tracing::debug!("access token expired, closing the WebSocket session");
+                    return session.close();
+                }
+                if let jsonrpc::Message::Request(req) = &msg {
+                    let missing = resource.missing_scopes(req, info);
+                    if !missing.is_empty() {
+                        let error = jsonrpc::ErrorObject::new(-32000, "Forbidden: the token lacks required scopes")
+                            .with_data(serde_json::json!({ "error": "insufficient_scope", "scopes": missing }));
+                        outlet.send(Outbound::Message(jsonrpc::Message::error(Some(req.id.clone()), error)));
+                        continue;
+                    }
+                }
+                crate::auth::scope(Some(info.clone()), || session.handle(msg, outlet));
+            }
             Ok(msg) => session.handle(msg, outlet),
             Err(error) => {
                 outlet.send(Outbound::Message(error));

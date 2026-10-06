@@ -246,3 +246,62 @@ async fn connect_ws_over_a_raw_stream() {
     tokio::time::timeout(Duration::from_secs(5), conn.wait()).await.unwrap().ok();
     assert!(session.is_closed());
 }
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn oauth_on_the_upgrade() {
+    use mcptk::auth::{AuthInfo, ProtectedResource, StaticTokens};
+
+    let server = Server::builder("ws-auth", "1")
+        .tool(Tool::new("whoami", "Who is calling"), |ctx, _args| async move {
+            Ok::<_, ToolError>(ctx.auth().map(|a| a.subject.clone()).unwrap_or_default())
+        })
+        .tool(Tool::new("admin", "Needs more"), |_ctx, _args| async move { Ok::<_, ToolError>("ok") })
+        .build();
+    let tokens = StaticTokens::new()
+        .token("alice-token", AuthInfo::new("alice").scopes(["mcp"]))
+        .token("weak-token", AuthInfo::new("bob"));
+    let resource = ProtectedResource::new("http://localhost/mcp", tokens)
+        .authorization_server("https://auth.example")
+        .require_scopes(["mcp"])
+        .tool_scopes("admin", ["admin"]);
+    let addr = start(WebSocketServer::new(server).auth(resource)).await;
+
+    let attempt = async |token: Option<&str>| {
+        let mut req = format!("ws://{addr}/mcp").into_client_request().unwrap();
+        if let Some(token) = token {
+            req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        }
+        tokio_tungstenite::connect_async(req).await
+    };
+    let status = |e: WsError| match e {
+        WsError::Http(res) => (res.status().as_u16(), res.headers().get("www-authenticate").is_some()),
+        other => panic!("unexpected error: {other:?}"),
+    };
+
+    // No token, a bad one, or one lacking the scopes every request needs.
+    assert_eq!(status(attempt(None).await.unwrap_err()), (401, true));
+    assert_eq!(status(attempt(Some("nope")).await.unwrap_err()), (401, true));
+    assert_eq!(status(attempt(Some("weak-token")).await.unwrap_err()), (403, true));
+
+    let (mut ws, _) = attempt(Some("alice-token")).await.unwrap();
+    init(&mut ws).await;
+    send(&mut ws, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"whoami"}})).await;
+    assert_eq!(recv(&mut ws).await["result"]["content"][0]["text"], "alice");
+    // A tool needing a scope the token lacks is refused per request.
+    send(&mut ws, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"admin"}})).await;
+    let refused = recv(&mut ws).await;
+    assert_eq!(refused["id"], 3);
+    assert_eq!(refused["error"]["data"], json!({"error":"insufficient_scope","scopes":["admin"]}));
+
+    // The metadata document is served next to the socket.
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tcp.write_all(b"GET /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut body = String::new();
+    tcp.read_to_string(&mut body).await.unwrap();
+    assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+    assert!(body.contains("https://auth.example"));
+}

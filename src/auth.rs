@@ -705,6 +705,31 @@ mod http_glue {
             self.validate(token).await.map(Arc::new).map_err(|e| self.refuse_with(e))
         }
 
+        /// Authenticate a connection that then carries many requests (a
+        /// WebSocket upgrade): the token, and the scopes every request needs.
+        #[allow(clippy::result_large_err)]
+        #[cfg_attr(not(feature = "ws"), allow(dead_code))]
+        pub(crate) async fn authenticate_connection(
+            &self,
+            headers: &HeaderMap,
+        ) -> Result<Arc<AuthInfo>, Response<McpBody>> {
+            let info = self.authenticate(headers).await?;
+            let needed = self.scopes_needed(std::iter::empty());
+            if needed.iter().all(|s| info.has_scope(s)) {
+                return Ok(info);
+            }
+            Err(self.refuse_with(AuthError::InsufficientScope { scopes: needed, description: None }))
+        }
+
+        /// The scopes `request` needs that `info` lacks, for transports
+        /// that can't answer with an HTTP 403.
+        #[cfg_attr(not(feature = "ws"), allow(dead_code))]
+        pub(crate) fn missing_scopes(&self, request: &crate::jsonrpc::Request, info: &AuthInfo) -> Vec<String> {
+            let mut needed = self.scopes_needed(std::iter::once(request));
+            needed.retain(|s| !info.has_scope(s));
+            needed
+        }
+
         /// Check the scopes needed by the requests in a POST.
         #[allow(clippy::result_large_err)]
         pub(crate) fn check_scopes(&self, messages: &[Message], ext: &Extensions) -> Result<(), Response<McpBody>> {

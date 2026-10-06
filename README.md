@@ -130,8 +130,12 @@ WebSocketServer::new(server.clone())
 
 Mount it in your own hyper/axum server with `WebSocketServer::handle(request)`
 (the connection must be served `with_upgrades()`), or serve an already
-upgraded `WebSocketStream` with `Server::connect_ws`. Authentication is up to
-you: check the request's headers before handing it over.
+upgraded `WebSocketStream` with `Server::connect_ws`.
+
+`WebSocketServer::auth(ProtectedResource)` requires an OAuth access token on
+the upgrade request, like [Streamable HTTP](#authorization-oauth) does:
+handlers get the identity from `ctx.auth()`, requests lacking a tool's scopes
+get a JSON-RPC error, and the socket closes when the token expires.
 
 ### Authorization (OAuth)
 
