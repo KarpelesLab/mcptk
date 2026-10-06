@@ -3,8 +3,7 @@
 //! handles...
 
 use crate::error::{Error, Result};
-use crate::jsonrpc;
-use crate::server::{Outbound, Outlet, Server, Session};
+use crate::server::{Outbound, Outlet, Server, Session, dispatch_text};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -104,14 +103,7 @@ async fn read_loop<R: AsyncRead + Unpin>(reader: R, session: &Session, outlet: &
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        for msg in jsonrpc::decode(&line) {
-            match msg {
-                Ok(msg) => session.handle(msg, outlet),
-                Err(error) => {
-                    outlet.send(Outbound::Message(error));
-                }
-            }
-        }
+        dispatch_text(&line, outlet, |msg, reply| session.handle(msg, reply));
     }
 }
 
@@ -149,10 +141,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(
 }
 
 async fn write_one<W: AsyncWrite + Unpin>(writer: &mut W, out: Outbound) -> std::io::Result<()> {
-    let Outbound::Message(msg) = out else {
+    let Some(mut line) = out.to_json()? else {
         return Ok(());
     };
-    let mut line = serde_json::to_vec(&msg)?;
     line.push(b'\n');
     writer.write_all(&line).await?;
     writer.flush().await

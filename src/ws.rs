@@ -23,8 +23,9 @@
 
 use crate::error::{Error, Result};
 use crate::io::Connection;
+#[cfg(feature = "http")]
 use crate::jsonrpc;
-use crate::server::{Outbound, Outlet, Server, Session};
+use crate::server::{Outbound, Outlet, Server, Session, dispatch_text};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
@@ -445,37 +446,34 @@ fn dispatch(text: &[u8], session: &Session, outlet: &Outlet, identity: &Identity
     }
     #[cfg(not(feature = "http"))]
     let _ = identity;
-    for msg in jsonrpc::decode(text) {
-        match msg {
-            #[cfg(feature = "http")]
-            Ok(msg) if identity.auth.is_some() => {
-                let Some((resource, info)) = &identity.auth else { unreachable!() };
-                if info.is_expired() {
-                    tracing::debug!("access token expired, closing the WebSocket session");
-                    return session.close();
-                }
-                if let jsonrpc::Message::Request(req) = &msg {
-                    let missing = resource.missing_scopes(req, info);
-                    if !missing.is_empty() {
-                        let error = jsonrpc::ErrorObject::new(-32000, "Forbidden: the token lacks required scopes")
-                            .with_data(serde_json::json!({ "error": "insufficient_scope", "scopes": missing }));
-                        outlet.send(Outbound::Message(jsonrpc::Message::error(Some(req.id.clone()), error)));
-                        continue;
-                    }
-                }
-                crate::auth::scope(Some(info.clone()), || session.handle(msg, outlet));
-            }
-            Ok(msg) => session.handle(msg, outlet),
-            Err(error) => {
-                outlet.send(Outbound::Message(error));
-            }
-        }
+    #[cfg(feature = "http")]
+    if let Some((_, info)) = &identity.auth
+        && info.is_expired()
+    {
+        tracing::debug!("access token expired, closing the WebSocket session");
+        return session.close();
     }
+    dispatch_text(text, outlet, |msg, reply| {
+        #[cfg(feature = "http")]
+        if let Some((resource, info)) = &identity.auth {
+            if let jsonrpc::Message::Request(req) = &msg {
+                let missing = resource.missing_scopes(req, info);
+                if !missing.is_empty() {
+                    let error = jsonrpc::ErrorObject::new(-32000, "Forbidden: the token lacks required scopes")
+                        .with_data(serde_json::json!({ "error": "insufficient_scope", "scopes": missing }));
+                    reply.send(Outbound::Message(jsonrpc::Message::error(Some(req.id.clone()), error)));
+                    return;
+                }
+            }
+            return crate::auth::scope(Some(info.clone()), || session.handle(msg, reply));
+        }
+        session.handle(msg, reply)
+    });
 }
 
 async fn send<S: AsyncRead + AsyncWrite + Unpin>(ws: &mut WebSocketStream<S>, out: Outbound) -> Result<()> {
-    let Outbound::Message(msg) = out else { return Ok(()) };
-    let text = serde_json::to_string(&msg)?;
+    let Some(json) = out.to_json()? else { return Ok(()) };
+    let text = String::from_utf8(json).map_err(|e| Error::Other(e.to_string()))?;
     ws.send(WsMessage::text(text)).await.map_err(ws_error)
 }
 

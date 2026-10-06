@@ -577,3 +577,35 @@ async fn paginated_lists() {
     let bad = c.call(99, "tools/list", json!({"cursor": "nonsense"})).await;
     assert_eq!(bad["error"]["code"], -32602);
 }
+
+#[tokio::test]
+async fn batches_are_answered_as_one() {
+    let server = test_server();
+    let mut c = Client::connect(&server);
+    c.init(json!({})).await;
+
+    // Two requests and a notification: one array with both responses.
+    c.send(json!([
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":1,"b":2}}},
+        {"jsonrpc":"2.0","method":"notifications/roots/list_changed"},
+        {"jsonrpc":"2.0","id":2,"method":"ping"},
+    ]))
+    .await;
+    let batch = c.recv().await;
+    let mut ids: Vec<i64> = batch.as_array().expect("a batch").iter().map(|m| m["id"].as_i64().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, [1, 2]);
+
+    // An invalid entry gets its error in the same array.
+    c.send(json!([{"jsonrpc":"2.0","id":3,"method":"ping"}, {"jsonrpc":"2.0","id":4}])).await;
+    let batch = c.recv().await;
+    let batch = batch.as_array().unwrap();
+    assert_eq!(batch.len(), 2);
+    assert!(batch.iter().any(|m| m["id"] == 4 && m["error"]["code"] == -32600));
+
+    // Notifications alone get no answer; an empty batch is one error.
+    c.send(json!([{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}])).await;
+    c.send(json!([])).await;
+    let err = c.recv().await;
+    assert_eq!(err["error"]["code"], -32600);
+}

@@ -22,7 +22,20 @@ use tokio_util::sync::CancellationToken;
 pub(crate) enum Outbound {
     Message(Message),
     /// The request finished without a response (it was cancelled).
-    Done(#[cfg_attr(not(feature = "http"), allow(dead_code))] RequestId),
+    Done(RequestId),
+    /// The responses to a batch of requests, to send as one JSON array.
+    Batch(Vec<Message>),
+}
+
+impl Outbound {
+    /// The JSON text to put on the wire, if any.
+    pub(crate) fn to_json(&self) -> serde_json::Result<Option<Vec<u8>>> {
+        match self {
+            Outbound::Message(msg) => serde_json::to_vec(msg).map(Some),
+            Outbound::Batch(msgs) => serde_json::to_vec(msgs).map(Some),
+            Outbound::Done(_) => Ok(None),
+        }
+    }
 }
 
 /// Where outgoing messages go: the transport's single stream (stdio), or
@@ -32,6 +45,84 @@ pub(crate) enum Outlet {
     Channel(mpsc::UnboundedSender<Outbound>),
     #[cfg(feature = "http")]
     Mailbox(Arc<crate::http::Mailbox>),
+    /// Collects the responses to a batch of requests.
+    Batch(Arc<Batcher>),
+}
+
+/// Gathers the responses to the requests of a batch (JSON-RPC batching, in
+/// MCP 2025-03-26 only), to answer with one array once all are in. Anything
+/// else the requests send goes straight through.
+pub(crate) struct Batcher {
+    outlet: Outlet,
+    /// Requests not answered yet, and the responses so far.
+    state: Mutex<(HashSet<RequestId>, Vec<Message>)>,
+}
+
+impl Batcher {
+    fn send(&self, out: Outbound) -> bool {
+        let mut state = self.state.lock().unwrap();
+        match out {
+            Outbound::Message(msg) if msg.response_id().is_some_and(|id| state.0.remove(id)) => state.1.push(msg),
+            Outbound::Done(id) => {
+                state.0.remove(&id);
+            }
+            other => {
+                drop(state);
+                return self.outlet.send(other);
+            }
+        }
+        if state.0.is_empty() && !state.1.is_empty() {
+            return self.outlet.send(Outbound::Batch(std::mem::take(&mut state.1)));
+        }
+        true
+    }
+}
+
+/// Handle the messages in one JSON text received on a single-stream
+/// transport (a line, a WebSocket frame): `handle` gets each message and
+/// where to answer it. Requests sent as a batch are answered as one.
+pub(crate) fn dispatch_text(text: &[u8], outlet: &Outlet, mut handle: impl FnMut(Message, &Outlet)) {
+    let decoded = crate::jsonrpc::decode(text);
+    let is_batch = text.trim_ascii_start().first() == Some(&b'[') && decoded.iter().any(Result::is_ok);
+    if !is_batch {
+        for msg in decoded {
+            match msg {
+                Ok(msg) => handle(msg, outlet),
+                Err(error) => {
+                    outlet.send(Outbound::Message(error));
+                }
+            }
+        }
+        return;
+    }
+    let mut pending = HashSet::new();
+    let mut messages = Vec::new();
+    let mut errors = Vec::new();
+    for msg in decoded {
+        match msg {
+            Ok(msg) => {
+                if let Message::Request(req) = &msg {
+                    pending.insert(req.id.clone());
+                }
+                messages.push(msg);
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    if pending.is_empty() {
+        if !errors.is_empty() {
+            outlet.send(Outbound::Batch(errors));
+        }
+        messages.into_iter().for_each(|msg| handle(msg, outlet));
+        return;
+    }
+    let batch = Outlet::Batch(Arc::new(Batcher { outlet: outlet.clone(), state: Mutex::new((pending, errors)) }));
+    for msg in messages {
+        match msg {
+            Message::Request(_) => handle(msg, &batch),
+            other => handle(other, outlet),
+        }
+    }
 }
 
 impl Outlet {
@@ -40,11 +131,14 @@ impl Outlet {
             Outlet::Channel(tx) => tx.send(out).is_ok(),
             #[cfg(feature = "http")]
             Outlet::Mailbox(mailbox) => {
-                if let Outbound::Message(msg) = out {
-                    mailbox.push(msg);
+                match out {
+                    Outbound::Message(msg) => mailbox.push(msg),
+                    Outbound::Batch(msgs) => msgs.into_iter().for_each(|msg| mailbox.push(msg)),
+                    Outbound::Done(_) => {}
                 }
                 true
             }
+            Outlet::Batch(batcher) => batcher.send(out),
         }
     }
 }

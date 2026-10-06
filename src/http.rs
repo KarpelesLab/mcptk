@@ -769,6 +769,7 @@ async fn stream_responses(
             Some(Outbound::Done(id)) => {
                 pending.remove(&id);
             }
+            Some(Outbound::Batch(_)) => {}
             Some(Outbound::Message(msg)) => {
                 if let Some(id) = msg.response_id() {
                     pending.remove(id);
@@ -798,6 +799,7 @@ async fn collect_responses(
             Some(Outbound::Done(id)) => {
                 pending.remove(&id);
             }
+            Some(Outbound::Batch(_)) => {}
             Some(Outbound::Message(msg)) => match msg.response_id() {
                 Some(id) => {
                     pending.remove(id);

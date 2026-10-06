@@ -12,7 +12,7 @@ pub use results::{IntoPromptResult, IntoReadResult, IntoToolResult, Json};
 pub use session::{RequestContext, Session};
 pub use template::match_uri_template;
 
-pub(crate) use session::{Outbound, Outlet};
+pub(crate) use session::{Outbound, Outlet, dispatch_text};
 
 use crate::channel::{self, ChannelEvent, PermissionRequest};
 use crate::error::{Error, Result, ToolError};
