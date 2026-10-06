@@ -129,6 +129,11 @@ pub struct Task {
     /// The JSON-RPC error (`failed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorObject>,
+    /// Who created the task: the OAuth subject of the `tools/call` request
+    /// (see [`RequestContext::auth`]), if authenticated. Only that subject
+    /// can then access the task. Kept by the store, never sent to clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl Task {
@@ -145,6 +150,9 @@ impl Task {
 
     fn to_result(&self, result_type: &str) -> Result<Value, ErrorObject> {
         let mut v = serde_json::to_value(self).map_err(|e| ErrorObject::internal(e.to_string()))?;
+        if let Value::Object(map) = &mut v {
+            map.remove("owner");
+        }
         v["resultType"] = result_type.into();
         Ok(v)
     }
@@ -344,13 +352,21 @@ impl TaskManager {
         self.running.lock().unwrap().get(task_id).cloned()
     }
 
-    /// A stored task, if it exists and hasn't expired (expired ones are
-    /// forgotten).
-    async fn lookup(&self, task_id: &str, what: &str) -> Result<Task> {
+    /// A stored task, if it exists, hasn't expired (expired ones are
+    /// forgotten) and, when `requester` is given, belongs to it. Tasks
+    /// created by an authenticated request belong to its subject; others
+    /// to whoever knows their id.
+    async fn lookup(&self, task_id: &str, what: &str, requester: Option<&RequestContext>) -> Result<Task> {
         let store = self.store();
         let Some(task) = store.get(task_id).await? else {
             return Err(not_found(what));
         };
+        if let (Some(owner), Some(ctx)) = (&task.owner, requester)
+            && ctx.auth().map(|a| &a.subject) != Some(owner)
+        {
+            // Same answer as for an unknown id: don't reveal it exists.
+            return Err(not_found(what));
+        }
         if task.is_expired() {
             let running = self.running.lock().unwrap().remove(task_id);
             if let Some(rt) = running {
@@ -386,6 +402,7 @@ impl TaskManager {
             input_requests: None,
             result: None,
             error: None,
+            owner: ctx.auth().map(|a| a.subject.clone()),
         };
         store.put(task.clone()).await.map_err(|e| e.to_error_object())?;
         let rt = Arc::new(RunningTask {
@@ -438,12 +455,12 @@ impl TaskManager {
 
     async fn get(self: Arc<Self>, ctx: RequestContext, params: Option<Value>) -> Result<Value> {
         let p: TaskIdParams = require_tasks(&ctx, params)?;
-        Ok(self.lookup(&p.task_id, "retrieve").await?.to_result("complete")?)
+        Ok(self.lookup(&p.task_id, "retrieve", Some(&ctx)).await?.to_result("complete")?)
     }
 
     async fn update(self: Arc<Self>, ctx: RequestContext, params: Option<Value>) -> Result<Value> {
         let p: UpdateTaskParams = require_tasks(&ctx, params)?;
-        self.lookup(&p.task_id, "update").await?;
+        self.lookup(&p.task_id, "update", Some(&ctx)).await?;
         if let Some(rt) = self.running(&p.task_id) {
             rt.answer(p.input_responses).await;
         }
@@ -452,7 +469,7 @@ impl TaskManager {
 
     async fn cancel(self: Arc<Self>, ctx: RequestContext, params: Option<Value>) -> Result<Value> {
         let p: TaskIdParams = require_tasks(&ctx, params)?;
-        self.lookup(&p.task_id, "cancel").await?;
+        self.lookup(&p.task_id, "cancel", Some(&ctx)).await?;
         if let Some(rt) = self.running(&p.task_id) {
             rt.cancel.cancel();
         }
@@ -684,50 +701,57 @@ impl TaskContext {
         }
     }
 
-    /// Whether the client declared `capability`: in the request's
-    /// per-request capabilities if it sent them, else at initialize.
-    /// The client's capabilities: per request (2026-07-28), else the
-    /// session's.
-    fn client_capabilities(&self) -> Option<ClientCapabilities> {
-        match self.request.meta().and_then(|m| m.get(CLIENT_CAPABILITIES_META)) {
-            Some(caps) => serde_json::from_value(caps.clone()).ok(),
-            None => self.session().client_capabilities().cloned(),
+    /// The client's capabilities: those sent with the request, if any,
+    /// else those declared at initialize.
+    fn client_capabilities(&self) -> ClientCapabilities {
+        let per_request = self.request.meta().and_then(|m| m.get(CLIENT_CAPABILITIES_META));
+        match per_request {
+            Some(caps) => serde_json::from_value(caps.clone()).unwrap_or_default(),
+            None => self.session().client_capabilities().cloned().unwrap_or_default(),
         }
     }
 
     fn require(&self, what: &'static str, has: impl Fn(&ClientCapabilities) -> bool) -> Result<()> {
-        match self.client_capabilities() {
-            Some(c) if has(&c) => Ok(()),
-            _ => Err(Error::Unsupported(what)),
-        }
+        if has(&self.client_capabilities()) { Ok(()) } else { Err(Error::Unsupported(what)) }
     }
 
-    async fn input_as<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
-        Ok(serde_json::from_value(self.input(method, params).await?)?)
+    async fn task_input<T: DeserializeOwned>(&self, method: &str, params: impl Serialize) -> Result<T> {
+        Ok(serde_json::from_value(self.input(method, serde_json::to_value(params)?).await?)?)
     }
 
-    /// Ask the user for input (elicitation).
+    /// Ask the user for input (elicitation). URL mode needs the client's
+    /// `elicitation.url` capability.
     pub async fn elicit(&self, params: ElicitParams) -> Result<ElicitResult> {
+        if self.task.is_none() {
+            return self.request.elicit(params).await;
+        }
         match &params {
             ElicitParams::Form(_) => self.require("elicitation", ClientCapabilities::supports_elicitation_form)?,
             ElicitParams::Url(_) => self.require("URL elicitation", ClientCapabilities::supports_elicitation_url)?,
         }
-        self.input_as("elicitation/create", serde_json::to_value(params)?).await
+        self.task_input("elicitation/create", params).await
     }
 
-    /// Ask the client's LLM for a completion (sampling).
+    /// Ask the client's LLM for a completion (sampling). Requests with tools
+    /// need the client's `sampling.tools` capability.
     pub async fn create_message(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
+        if self.task.is_none() {
+            return self.request.create_message(params).await;
+        }
         self.require("sampling", |c| c.sampling.is_some())?;
         if params.uses_tools() {
             self.require("sampling with tools", ClientCapabilities::supports_sampling_tools)?;
         }
-        self.input_as("sampling/createMessage", serde_json::to_value(params)?).await
+        self.task_input("sampling/createMessage", params).await
     }
 
     /// The client's roots.
     pub async fn list_roots(&self) -> Result<ListRootsResult> {
+        if self.task.is_none() {
+            return self.request.list_roots().await;
+        }
         self.require("roots", |c| c.roots.is_some())?;
-        self.input_as("roots/list", json!({})).await
+        self.task_input("roots/list", json!({})).await
     }
 }
 
@@ -863,7 +887,7 @@ impl Server {
 
     /// A task's current state, if it exists and hasn't expired.
     pub async fn task(&self, task_id: &str) -> Option<Task> {
-        self.inner.config.tasks.as_ref()?.lookup(task_id, "retrieve").await.ok()
+        self.inner.config.tasks.as_ref()?.lookup(task_id, "retrieve", None).await.ok()
     }
 
     /// Ask a running task to stop (it ends `cancelled`). Returns whether it
@@ -1002,6 +1026,7 @@ mod tests {
             input_requests: Some(JsonObject::new()),
             result: None,
             error: None,
+            owner: Some("alice".into()),
         };
         assert_eq!(
             task.to_result("complete").unwrap(),

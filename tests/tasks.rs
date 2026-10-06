@@ -407,12 +407,24 @@ mod http {
     use mcptk::http::StreamableHttp;
 
     async fn post(http: &StreamableHttp, session: Option<&str>, body: Value) -> (Option<String>, Value) {
+        post_as(http, None, session, body).await
+    }
+
+    async fn post_as(
+        http: &StreamableHttp,
+        token: Option<&str>,
+        session: Option<&str>,
+        body: Value,
+    ) -> (Option<String>, Value) {
         let mut req = Request::post("/mcp")
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", "2025-11-25");
         if let Some(s) = session {
             req = req.header("mcp-session-id", s);
+        }
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
         }
         let res = http.handle(req.body(Full::new(Bytes::from(body.to_string()))).unwrap()).await;
         assert_eq!(res.status(), StatusCode::OK);
@@ -421,10 +433,14 @@ mod http {
     }
 
     async fn session(http: &StreamableHttp) -> String {
+        session_as(http, None).await
+    }
+
+    async fn session_as(http: &StreamableHttp, token: Option<&str>) -> String {
         let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}
         }});
-        let (sid, _) = post(http, None, init).await;
+        let (sid, _) = post_as(http, token, None, init).await;
         sid.unwrap()
     }
 
@@ -461,5 +477,51 @@ mod http {
         }
         assert_eq!(status["status"], "completed");
         assert_eq!(status["result"]["content"][0]["text"], "done (task: true)");
+    }
+
+    /// With OAuth, a task belongs to the subject that created it, and its
+    /// handler still sees the caller's identity while running in the
+    /// background.
+    #[tokio::test]
+    async fn tasks_belong_to_their_creator() {
+        use mcptk::auth::{AuthInfo, ProtectedResource, StaticTokens};
+        let server = Server::builder("auth-tasks", "1")
+            .task_tool(Tool::new("whoami", "Who called"), |ctx: TaskContext, _args| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let who = ctx.request().auth().map(|a| a.subject.clone()).unwrap_or_default();
+                Ok::<_, ToolError>(who)
+            })
+            .build();
+        let tokens = StaticTokens::new().token("a", AuthInfo::new("alice")).token("b", AuthInfo::new("bob"));
+        let http = StreamableHttp::new(server)
+            .json_response(true)
+            .auth(ProtectedResource::new("https://mcp.example.com/mcp", tokens));
+        let alice = session_as(&http, Some("a")).await;
+        let bob = session_as(&http, Some("b")).await;
+
+        let call = request(2, "tools/call", json!({"name":"whoami"}));
+        let (_, res) = post_as(&http, Some("a"), Some(&alice), call).await;
+        let id = res["result"]["taskId"].as_str().unwrap().to_string();
+        assert!(res["result"].get("owner").is_none());
+
+        for method in ["tasks/get", "tasks/cancel"] {
+            let (_, res) = post_as(&http, Some("b"), Some(&bob), request(3, method, json!({"taskId": id}))).await;
+            assert_eq!(res["error"]["code"], -32602, "{res}");
+            assert!(res["error"]["message"].as_str().unwrap().ends_with("Task not found"));
+        }
+
+        let mut status = Value::Null;
+        for n in 0..200 {
+            let get = request(10 + n, "tasks/get", json!({"taskId": id}));
+            let (_, res) = post_as(&http, Some("a"), Some(&alice), get).await;
+            status = res["result"].clone();
+            if status["status"] != "working" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["result"]["content"][0]["text"], "alice");
+        assert!(status.get("owner").is_none());
     }
 }

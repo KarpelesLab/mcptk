@@ -230,8 +230,11 @@ Server::builder("jobs", "1.0")
 - **Expiry.** Each task expires `ttl` after it is created (one hour by
   default). A task still running at that point is cancelled. After expiry,
   the task is forgotten and `tasks/get` returns an error.
-- Task ids are 128-bit random values, and they are the only credential a
-  client needs to access a task.
+- **Access.** Task ids are 128-bit random values. With [OAuth](#authorization-oauth),
+  a task belongs to the subject whose request created it, and other subjects
+  get "task not found". Without OAuth, the task id is the only credential a
+  client needs. The handler keeps the creating request's `ctx.auth()` while
+  it runs in the background.
 
 The server doesn't support the experimental tasks from 2025-11-25
 (`capabilities.tasks`, the `task` parameter, `tasks/result`, `tasks/list`).
