@@ -218,11 +218,11 @@ async fn without_the_extension_tools_run_inline() {
     let res = c.call_raw("tools/call", json!({"name":"gated"})).await;
     assert_eq!(res["result"], json!({"content":[{"type":"text","text":"done (task: false)"}]}));
 
-    // A legacy protocol version in _meta means the extension doesn't apply.
+    // A handshake protocol version in _meta isn't a valid stateless request.
     let mut meta = caps();
     meta["io.modelcontextprotocol/protocolVersion"] = "2025-11-25".into();
     let res = c.call_raw("tools/call", json!({"name":"quick","_meta":meta})).await;
-    assert_eq!(res["result"]["content"][0]["text"], "quick");
+    assert_eq!(res["error"]["code"], -32022);
 
     // Tools that must run as tasks need the extension.
     let res = c.call_raw("tools/call", json!({"name":"must_task"})).await;
@@ -233,7 +233,8 @@ async fn without_the_extension_tools_run_inline() {
 
     // Plain tools never become tasks.
     let res = c.call("tools/call", json!({"name":"plain"})).await;
-    assert_eq!(res["result"], json!({"content":[{"type":"text","text":"plain"}]}));
+    assert_eq!(res["result"]["resultType"], "complete");
+    assert_eq!(res["result"]["content"], json!([{"type":"text","text":"plain"}]));
 
     // Unknown tools are an error, not a task.
     let res = c.call("tools/call", json!({"name":"missing"})).await;
@@ -269,14 +270,14 @@ async fn cancellation() {
     let id = c.start("forever").await;
     assert_eq!(c.get(&id).await["result"]["status"], "working");
     let ack = c.call("tasks/cancel", json!({"taskId": id})).await;
-    assert_eq!(ack["result"], json!({"resultType":"complete"}));
+    assert_eq!(ack["result"]["resultType"], "complete", "{ack}");
     let res = c.wait_past(&id, "working").await;
     assert_eq!(res["result"]["status"], "cancelled");
     assert!(f.dropped.load(Ordering::SeqCst), "the handler was dropped");
 
     // Cancelling a finished task is acknowledged and changes nothing.
     let ack = c.call("tasks/cancel", json!({"taskId": id})).await;
-    assert_eq!(ack["result"], json!({"resultType":"complete"}));
+    assert_eq!(ack["result"]["resultType"], "complete", "{ack}");
     assert_eq!(c.get(&id).await["result"]["status"], "cancelled");
 
     // The server can cancel too.
@@ -307,7 +308,7 @@ async fn input_required_and_update() {
 
     // Responses to unknown keys are ignored.
     let ack = c.call("tasks/update", json!({"taskId": id, "inputResponses": {"nope": {"action": "cancel"}}})).await;
-    assert_eq!(ack["result"], json!({"resultType":"complete"}));
+    assert_eq!(ack["result"]["resultType"], "complete", "{ack}");
     assert_eq!(c.get(&id).await["result"]["status"], "input_required");
 
     let ack = c
@@ -316,7 +317,7 @@ async fn input_required_and_update() {
             json!({"taskId": id, "inputResponses": {"input-1": {"action": "accept", "content": {"name": "Luca"}}}}),
         )
         .await;
-    assert_eq!(ack["result"], json!({"resultType":"complete"}));
+    assert_eq!(ack["result"]["resultType"], "complete", "{ack}");
     let res = c.wait_past(&id, "input_required").await;
     let res = if res["result"]["status"] == "working" { c.wait_past(&id, "working").await } else { res };
     assert_eq!(res["result"]["status"], "completed");
@@ -416,10 +417,19 @@ mod http {
         session: Option<&str>,
         body: Value,
     ) -> (Option<String>, Value) {
+        // Stateless (2026-07-28) requests need headers matching the body.
+        let version =
+            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str().unwrap_or("2025-11-25");
         let mut req = Request::post("/mcp")
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
-            .header("mcp-protocol-version", "2025-11-25");
+            .header("mcp-protocol-version", version);
+        if let Some(method) = body["method"].as_str() {
+            req = req.header("mcp-method", method);
+        }
+        if let Some(name) = body["params"]["name"].as_str() {
+            req = req.header("mcp-name", name);
+        }
         if let Some(s) = session {
             req = req.header("mcp-session-id", s);
         }

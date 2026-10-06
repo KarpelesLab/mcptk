@@ -1,10 +1,13 @@
 //! Building MCP servers.
 
+mod input;
 mod results;
 mod session;
+pub(crate) mod stateless;
 pub mod tasks;
 mod template;
 
+pub use input::InputRequired;
 pub use results::{IntoPromptResult, IntoReadResult, IntoToolResult, Json};
 pub use session::{RequestContext, Session};
 pub use template::match_uri_template;
@@ -13,7 +16,6 @@ pub(crate) use session::{Outbound, Outlet};
 
 use crate::channel::{self, ChannelEvent, PermissionRequest};
 use crate::error::{Error, Result, ToolError};
-use crate::jsonrpc::ErrorObject;
 use crate::types::*;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -22,11 +24,11 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::Duration;
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-type ToolFn =
-    Arc<dyn Fn(RequestContext, Option<JsonObject>) -> BoxFuture<Result<CallToolResult, ErrorObject>> + Send + Sync>;
+type ToolFn = Arc<dyn Fn(RequestContext, Option<JsonObject>) -> BoxFuture<Result<CallToolResult>> + Send + Sync>;
 type ResourceFn = Arc<dyn Fn(RequestContext, String) -> BoxFuture<Result<ReadResourceResult>> + Send + Sync>;
 type TemplateFn =
     Arc<dyn Fn(RequestContext, String, HashMap<String, String>) -> BoxFuture<Result<ReadResourceResult>> + Send + Sync>;
@@ -74,6 +76,8 @@ struct Config {
     tool_filter: Option<ToolFilter>,
     /// The tasks extension, when enabled (see the `tasks` module).
     tasks: Option<Arc<tasks::TaskManager>>,
+    cache_ttl: Duration,
+    cache_scope: CacheScope,
 }
 
 pub(crate) struct ServerInner {
@@ -83,6 +87,7 @@ pub(crate) struct ServerInner {
     templates: RwLock<Vec<Arc<TemplateEntry>>>,
     prompts: RwLock<Vec<Arc<PromptEntry>>>,
     sessions: Mutex<HashMap<String, Weak<SessionInner>>>,
+    listeners: stateless::Listeners,
 }
 
 /// An MCP server: what it offers (tools, resources, prompts...) and its live
@@ -150,17 +155,24 @@ impl Server {
         self.sessions().iter().filter(|s| s.channel_event(event).is_ok()).count()
     }
 
-    /// Tell sessions subscribed to `uri` that it changed.
+    /// Tell sessions subscribed to `uri` that it changed (and
+    /// `subscriptions/listen` streams watching it).
     pub fn notify_resource_updated(&self, uri: &str) {
         for s in self.sessions() {
-            let _ = s.notify_resource_updated(uri);
+            if s.inner.subscribed(uri) {
+                let _ = s.notify("notifications/resources/updated", Some(serde_json::json!({ "uri": uri })));
+            }
         }
+        self.inner.listeners.notify("notifications/resources/updated", Some(uri), None);
     }
 
+    /// Send a list change notification to every session and to the
+    /// `subscriptions/listen` streams that asked for it.
     fn broadcast(&self, method: &str) {
         for s in self.sessions() {
             let _ = s.notify(method, None);
         }
+        self.inner.listeners.notify(method, None, None);
     }
 
     /// The tools, in registration order.
@@ -273,19 +285,22 @@ impl Server {
         tools.iter().filter(|e| self.tool_visible(session, &e.tool)).map(|e| e.tool.clone()).collect()
     }
 
-    pub(crate) async fn call_tool(
-        &self,
-        ctx: RequestContext,
-        params: CallToolParams,
-    ) -> Result<CallToolResult, ErrorObject> {
+    pub(crate) async fn call_tool(&self, ctx: RequestContext, params: CallToolParams) -> Result<CallToolResult> {
         let entry = {
             let tools = self.inner.tools.read().unwrap();
             tools.iter().find(|e| e.tool.name == params.name).cloned()
         };
         match entry {
             Some(e) if self.tool_visible(ctx.session(), &e.tool) => (e.handler)(ctx, params.arguments).await,
-            _ => Err(ErrorObject::invalid_params(format!("unknown tool: {}", params.name))),
+            _ => Err(Error::invalid_params(format!("unknown tool: {}", params.name))),
         }
+    }
+
+    /// The input schema of a tool, by name.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub(crate) fn tool_input_schema(&self, name: &str) -> Option<Value> {
+        let tools = self.inner.tools.read().unwrap();
+        tools.iter().find(|e| e.tool.name == name).map(|e| e.tool.input_schema.clone())
     }
 
     pub(crate) fn list_resources(&self) -> Vec<Resource> {
@@ -507,6 +522,8 @@ impl ServerBuilder {
                 on_initialized: Vec::new(),
                 tool_filter: None,
                 tasks: None,
+                cache_ttl: Duration::ZERO,
+                cache_scope: CacheScope::Public,
             },
             tools: Vec::new(),
             resources: Vec::new(),
@@ -553,6 +570,25 @@ impl ServerBuilder {
     /// `io.modelcontextprotocol/tasks`) with its settings object.
     pub fn extension(mut self, id: impl Into<String>, settings: Value) -> Self {
         self.config.extensions.insert(id.into(), settings);
+        self
+    }
+
+    /// How long clients may cache list results (`tools/list`, `prompts/list`,
+    /// `resources/list`, `resources/templates/list`), `resources/read` and
+    /// `server/discover` results: their `ttlMs` (2026-07-28+). Default zero:
+    /// always re-fetch. Clients listening with `subscriptions/listen` are
+    /// still told about changes right away.
+    pub fn cache_ttl(mut self, ttl: Duration) -> Self {
+        self.config.cache_ttl = ttl;
+        self
+    }
+
+    /// Who may cache those results: their `cacheScope` (2026-07-28+).
+    /// Default [`CacheScope::Public`]; `tools/list` is always
+    /// [`CacheScope::Private`] with a [`tool_filter`](Self::tool_filter).
+    /// Use `Private` when results depend on who is asking.
+    pub fn cache_scope(mut self, scope: CacheScope) -> Self {
+        self.config.cache_scope = scope;
         self
     }
 
@@ -755,6 +791,7 @@ impl ServerBuilder {
                 templates: RwLock::new(self.templates),
                 prompts: RwLock::new(self.prompts),
                 sessions: Mutex::new(HashMap::new()),
+                listeners: Default::default(),
             }),
         }
     }

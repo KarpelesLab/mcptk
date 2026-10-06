@@ -15,10 +15,17 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 /// Internal JSON-RPC error.
 pub const INTERNAL_ERROR: i64 = -32603;
-/// MCP: the requested resource does not exist.
+/// MCP: the requested resource does not exist (handshake revisions; 2026-07-28
+/// uses [`INVALID_PARAMS`], and mcptk converts it for those requests).
 pub const RESOURCE_NOT_FOUND: i64 = -32002;
 /// MCP (2025-11-25+): the request needs URL mode elicitations completed first.
 pub const URL_ELICITATION_REQUIRED: i64 = -32042;
+/// MCP (2026-07-28+): HTTP headers missing, malformed, or not matching the body.
+pub const HEADER_MISMATCH: i64 = -32020;
+/// MCP (2026-07-28+): the request needs a client capability it didn't declare.
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+/// MCP (2026-07-28+): the request's protocol version isn't supported.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 
 /// A request id: a string or an integer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -105,6 +112,28 @@ impl ErrorObject {
         elicitations: Vec<crate::types::ElicitUrlParams>,
     ) -> Self {
         Self::new(URL_ELICITATION_REQUIRED, message).with_data(serde_json::json!({ "elicitations": elicitations }))
+    }
+
+    /// `HeaderMismatchError` (2026-07-28+).
+    pub fn header_mismatch(message: impl Into<String>) -> Self {
+        Self::new(HEADER_MISMATCH, message)
+    }
+
+    /// `MissingRequiredClientCapabilityError` (2026-07-28+): `required` is a
+    /// `ClientCapabilities` object holding the missing capabilities, e.g.
+    /// `{"elicitation": {}}`.
+    pub fn missing_client_capability(required: Value) -> Self {
+        Self::new(MISSING_REQUIRED_CLIENT_CAPABILITY, "missing required client capability")
+            .with_data(serde_json::json!({ "requiredCapabilities": required }))
+    }
+
+    /// `UnsupportedProtocolVersionError` (2026-07-28+), listing the versions
+    /// this crate supports.
+    pub fn unsupported_protocol_version(requested: &str) -> Self {
+        Self::new(UNSUPPORTED_PROTOCOL_VERSION, "unsupported protocol version").with_data(serde_json::json!({
+            "supported": crate::types::SUPPORTED_PROTOCOL_VERSIONS,
+            "requested": requested,
+        }))
     }
 }
 

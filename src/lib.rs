@@ -7,6 +7,11 @@
 //! [Claude Code channels](channel), which let a server push events into a
 //! session and relay its permission prompts.
 //!
+//! Servers speak protocol revision 2026-07-28 (stateless: each request
+//! carries its metadata) and the handshake-based revisions before it, at the
+//! same time. See [`RequestContext`] for writing handlers that work with
+//! both, and [`InputRequired`] for multi round-trip requests.
+//!
 //! ```no_run
 //! use mcptk::{Server, Tool, ToolError};
 //!
@@ -44,7 +49,7 @@ pub mod ws;
 pub use channel::{Behavior, ChannelEvent, PermissionRequest, PermissionVerdict};
 pub use error::{Error, Result, ToolError};
 pub use io::Connection;
-pub use server::{Json, RequestContext, Server, ServerBuilder, Session, tasks};
+pub use server::{InputRequired, Json, RequestContext, Server, ServerBuilder, Session, tasks};
 pub use types::{
     CallToolResult, Content, LoggingLevel, Prompt, PromptMessage, Resource, ResourceContents, ResourceTemplate, Tool,
 };

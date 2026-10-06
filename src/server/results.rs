@@ -2,7 +2,6 @@
 
 use crate::types::{CallToolResult, Content, GetPromptResult, PromptMessage, ReadResourceResult, ResourceContents};
 use serde::Serialize;
-use serde_json::Value;
 
 /// Something a tool handler can return.
 pub trait IntoToolResult {
@@ -46,21 +45,19 @@ impl IntoToolResult for () {
 }
 
 /// Return a value as JSON: serialized as text content, and as
-/// `structuredContent` when it is an object (pair it with
+/// `structuredContent` (pair it with
 /// [`Tool::output_schema_for`](crate::types::Tool::output_schema_for)).
+///
+/// Protocol 2026-07-28 allows any JSON value as `structuredContent`; older
+/// revisions only objects, so for those clients other values are sent as
+/// text only.
 #[derive(Clone, Debug)]
 pub struct Json<T>(pub T);
 
 impl<T: Serialize> IntoToolResult for Json<T> {
     fn into_tool_result(self) -> CallToolResult {
         match serde_json::to_value(&self.0) {
-            Ok(value) => {
-                let result = CallToolResult::text(value.to_string());
-                match value {
-                    Value::Object(_) => result.structured(value),
-                    _ => result,
-                }
-            }
+            Ok(value) => CallToolResult::text(value.to_string()).structured(value),
             Err(e) => CallToolResult::error(format!("failed to serialize result: {e}")),
         }
     }

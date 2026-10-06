@@ -7,8 +7,10 @@ support for newer features such as [Claude Code channels](#channels).
 mcptk implements the protocol itself, on tokio and serde. It does not wrap
 another MCP SDK.
 
-- **Protocol**: revisions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05,
-  negotiated per session.
+- **Protocol**: revision [2026-07-28](#protocol-2026-07-28) (stateless,
+  per-request metadata), and the handshake-based revisions 2025-11-25,
+  2025-06-18, 2025-03-26 and 2024-11-05, negotiated per session. One server
+  serves both kinds of clients, on any transport.
 - **Server features**: tools (raw or typed with JSON Schema derived by
   `schemars`, structured output), resources, resource templates and
   subscriptions, prompts, completions, logging, progress, cancellation,
@@ -241,6 +243,55 @@ The server doesn't support the experimental tasks from 2025-11-25
 They aren't wire-compatible with the extension. Task status notifications
 (`notifications/tasks`) aren't sent either, so clients have to poll.
 
+## Protocol 2026-07-28
+
+Clients on revision 2026-07-28 skip the `initialize` handshake: every request
+carries its protocol version, client capabilities and client info in
+`_meta`. mcptk answers them statelessly next to handshake sessions, on stdio,
+WebSocket and HTTP alike, and implements `server/discover`,
+`subscriptions/listen`, `resultType`, `ttlMs`/`cacheScope`, per-request log
+levels, the `Mcp-Method`/`Mcp-Name`/`Mcp-Param-*` HTTP headers, and the new
+error codes. Fields that only exist in 2026-07-28 are only sent to those
+clients, so handshake clients see exactly what they did before.
+
+Handlers mostly don't need to care which revision a client speaks:
+
+- `ctx.client_info()` and `ctx.client_capabilities()` come from the request
+  or from the session; `ctx.is_stateless()` tells which.
+- `ctx.elicit()`, `ctx.create_message()` and `ctx.list_roots()` send a request
+  to handshake clients. For 2026-07-28 clients they use multi round-trip
+  requests: the call fails with `Error::InputRequired`; let it propagate with
+  `?`, the client retries with the answer, the handler runs again and the call
+  returns it. Make these calls in the same order on every run.
+- To ask several things at once, or to keep your own state, return an
+  `InputRequired` and read the answers with `ctx.input_response(key)` and
+  `ctx.request_state()`. For handshake clients mcptk sends the requests itself
+  and runs the handler again, so the same code serves both.
+
+```rust
+.tool(Tool::new("delete_all", "Delete everything"), |ctx, _args| async move {
+    match ctx.input_response::<ElicitResult>("confirm")? {
+        Some(r) if r.action == ElicitAction::Accept => Ok("deleted".to_string()),
+        Some(_) => Ok("kept".to_string()),
+        None => Err(InputRequired::new()
+            .elicit("confirm", ElicitParams::form("Really?", json!({"type": "object"})))
+            .into()),
+    }
+})
+```
+
+Results carry `ttlMs` and `cacheScope` hints: set them with
+`ServerBuilder::cache_ttl` (default 0) and `cache_scope` (default public;
+`tools/list` is private with a `tool_filter`). There are no sessions in this
+revision: logs, channel events and list changes only go to initialized
+sessions, while 2026-07-28 clients get list changes and resource updates on
+`subscriptions/listen` streams. Over HTTP each of their requests gets a
+fresh `Session`, so per-session data doesn't carry over.
+
+**Channels need a handshake revision.** Claude Code only delivers channel
+messages from servers it talks to over the handshake revisions, so keep
+channel servers on those (mcptk does, since Claude Code initializes them).
+
 ## Channels
 
 A channel is an MCP server, spawned by Claude Code over stdio, that pushes
@@ -357,6 +408,7 @@ Run one with `cargo run --example echo`.
 
 - Resuming HTTP streams with `Last-Event-ID`
 - Pagination cursors (lists are returned whole)
+- Task status notifications on `subscriptions/listen` (tasks extension)
 
 ## License
 

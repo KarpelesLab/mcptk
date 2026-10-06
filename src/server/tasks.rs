@@ -63,17 +63,17 @@ pub const EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
 
 /// `_meta` key carrying the client's capabilities on each request
 /// (2026-07-28).
-pub const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
+pub const CLIENT_CAPABILITIES_META: &str = crate::types::META_CLIENT_CAPABILITIES;
 
 /// `_meta` key carrying the request's protocol revision (2026-07-28).
-pub const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
+pub const PROTOCOL_VERSION_META: &str = crate::types::META_PROTOCOL_VERSION;
 
 /// JSON-RPC error code: the request needs a capability the client didn't
 /// declare (2026-07-28).
-pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = crate::jsonrpc::MISSING_REQUIRED_CLIENT_CAPABILITY;
 
 /// Revisions where the extension is not defined.
-const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const LEGACY_VERSIONS: &[&str] = crate::types::HANDSHAKE_PROTOCOL_VERSIONS;
 
 /// The status of a task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -287,6 +287,10 @@ pub enum TaskMode {
 /// defined for revisions up to 2025-11-25, and the spec requires the
 /// declaration on the request itself.
 pub fn client_supports_tasks(ctx: &RequestContext) -> bool {
+    if ctx.is_stateless() {
+        let extensions = ctx.client_capabilities().and_then(|c| c.extensions.as_ref());
+        return extensions.and_then(|e| e.get(EXTENSION_ID)).is_some_and(Value::is_object);
+    }
     declares_tasks(ctx.meta())
 }
 
@@ -434,6 +438,7 @@ impl TaskManager {
                         rt.finish(TaskStatus::Completed, None, |t| t.result = Some(result)).await;
                     }
                     Err(e) => {
+                        let e = e.to_error_object();
                         let message = e.message.clone();
                         rt.finish(TaskStatus::Failed, Some(message), |t| t.error = Some(e)).await;
                     }
@@ -697,13 +702,16 @@ impl TaskContext {
     pub async fn input(&self, method: &str, params: Value) -> Result<Value> {
         match &self.task {
             Some(t) => t.input(method, params).await,
-            None => self.request.request(method, Some(params)).await,
+            None => self.request.ask(method, params).await,
         }
     }
 
-    /// The client's capabilities: those sent with the request, if any,
-    /// else those declared at initialize.
+    /// The client's capabilities: those sent with the request (2026-07-28),
+    /// if any, else those declared at initialize.
     fn client_capabilities(&self) -> ClientCapabilities {
+        if self.request.is_stateless() {
+            return self.request.client_capabilities().cloned().unwrap_or_default();
+        }
         let per_request = self.request.meta().and_then(|m| m.get(CLIENT_CAPABILITIES_META));
         match per_request {
             Some(caps) => serde_json::from_value(caps.clone()).unwrap_or_default(),
@@ -902,23 +910,19 @@ impl Server {
 
     /// Answer a `tools/call`: with a task handle when the tool is a task tool
     /// and the request allows it, else with the tool's result.
-    pub(crate) async fn route_tool_call(
-        &self,
-        ctx: RequestContext,
-        params: CallToolParams,
-    ) -> Result<Value, ErrorObject> {
+    pub(crate) async fn route_tool_call(&self, ctx: RequestContext, params: CallToolParams) -> Result<Value> {
         if let Some(manager) = &self.inner.config.tasks {
             let mode = manager.mode(&params.name);
             if mode != TaskMode::Never && self.tool_exists_for(ctx.session(), &params.name) {
                 if client_supports_tasks(&ctx) {
-                    return manager.start(self.clone(), ctx, params).await;
+                    return Ok(manager.start(self.clone(), ctx, params).await?);
                 }
                 if mode == TaskMode::Required {
-                    return Err(missing_capability_error());
+                    return Err(missing_capability_error().into());
                 }
             }
         }
-        serde_json::to_value(self.call_tool(ctx, params).await?).map_err(|e| ErrorObject::internal(e.to_string()))
+        Ok(serde_json::to_value(self.call_tool(ctx, params).await?)?)
     }
 
     fn tool_exists_for(&self, session: &Session, name: &str) -> bool {

@@ -173,7 +173,7 @@ async fn unknown_protocol_version_gets_latest() {
     let server = test_server();
     let mut c = Client::connect(&server);
     let res = c.call(1, "initialize", json!({"protocolVersion":"1990-01-01","capabilities":{}})).await;
-    assert_eq!(res["result"]["protocolVersion"], types::LATEST_PROTOCOL_VERSION);
+    assert_eq!(res["result"]["protocolVersion"], types::LATEST_HANDSHAKE_PROTOCOL_VERSION);
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 //! MCP protocol types.
 //!
-//! These follow the MCP schema (up to revision 2025-11-25). Fields that are
+//! These follow the MCP schema (up to revision 2026-07-28). Fields that are
 //! rarely used or still moving are kept as raw JSON so newer peers don't break
 //! us.
 
@@ -11,17 +11,64 @@ use std::collections::HashMap;
 /// A JSON object.
 pub type JsonObject = Map<String, Value>;
 
-/// The newest protocol revision this crate speaks.
-pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+/// The newest protocol revision this crate speaks (a stateless revision:
+/// see [`STATELESS_PROTOCOL_VERSIONS`]).
+pub const LATEST_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// The newest revision that uses the `initialize` handshake: what
+/// `initialize` falls back to for clients asking for one we don't know.
+pub const LATEST_HANDSHAKE_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Every protocol revision this crate accepts, newest first.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-/// Pick the revision to use for a client that asked for `requested`: the same
-/// one if we support it, else our latest (the client then decides whether to
-/// go on).
+/// Revisions without a handshake (2026-07-28 and later): every request
+/// carries its protocol version and client capabilities in `_meta`.
+pub const STATELESS_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28"];
+
+/// Revisions that open a session with the `initialize` handshake, newest
+/// first.
+pub const HANDSHAKE_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Pick the revision to use for a client that asked for `requested` in
+/// `initialize`: the same one if it is a handshake revision we support, else
+/// our latest handshake revision (the client then decides whether to go on).
+/// Never a stateless revision: those have no handshake.
 pub fn negotiate_protocol_version(requested: &str) -> &'static str {
-    SUPPORTED_PROTOCOL_VERSIONS.iter().find(|v| **v == requested).copied().unwrap_or(LATEST_PROTOCOL_VERSION)
+    HANDSHAKE_PROTOCOL_VERSIONS.iter().find(|v| **v == requested).copied().unwrap_or(LATEST_HANDSHAKE_PROTOCOL_VERSION)
+}
+
+/// Whether `version` is a stateless revision this crate supports.
+pub fn is_stateless_protocol_version(version: &str) -> bool {
+    STATELESS_PROTOCOL_VERSIONS.contains(&version)
+}
+
+/// `_meta` key (requests, 2026-07-28+): the protocol revision of the request.
+pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+/// `_meta` key (requests, 2026-07-28+): the client's [`Implementation`].
+pub const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+/// `_meta` key (requests, 2026-07-28+): the client's [`ClientCapabilities`].
+pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+/// `_meta` key (requests, 2026-07-28+): the lowest [`LoggingLevel`] to send
+/// `notifications/message` for; none are sent without it.
+pub const META_LOG_LEVEL: &str = "io.modelcontextprotocol/logLevel";
+/// `_meta` key (results, 2026-07-28+): the server's [`Implementation`].
+pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+/// `_meta` key (notifications, 2026-07-28+): the id of the
+/// `subscriptions/listen` request a notification belongs to.
+pub const META_SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
+
+/// Who may cache a result (2026-07-28+), like HTTP `Cache-Control`
+/// `public`/`private`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheScope {
+    /// Holds no user-specific data: shared caches may serve it to anyone.
+    #[default]
+    Public,
+    /// Only reusable within the same authorization context.
+    Private,
 }
 
 /// An icon for a server, tool, resource or prompt.
@@ -159,6 +206,40 @@ pub struct InitializeResult {
     pub server_info: Implementation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+}
+
+/// The result of `server/discover` (2026-07-28+). `resultType`, `ttlMs`,
+/// `cacheScope` and `_meta` are added when it is sent.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverResult {
+    pub supported_versions: Vec<String>,
+    pub capabilities: ServerCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Which notifications a `subscriptions/listen` stream carries
+/// (2026-07-28+).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_list_changed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts_list_changed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources_list_changed: Option<bool>,
+    /// URIs to receive `notifications/resources/updated` for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_subscriptions: Option<Vec<String>>,
+}
+
+/// `subscriptions/listen` parameters.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ListenParams {
+    #[serde(default)]
+    pub notifications: SubscriptionFilter,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1319,6 +1400,7 @@ mod tests {
     #[test]
     fn negotiates() {
         assert_eq!(negotiate_protocol_version("2025-03-26"), "2025-03-26");
-        assert_eq!(negotiate_protocol_version("1999-01-01"), LATEST_PROTOCOL_VERSION);
+        assert_eq!(negotiate_protocol_version("1999-01-01"), LATEST_HANDSHAKE_PROTOCOL_VERSION);
+        assert_eq!(negotiate_protocol_version("2026-07-28"), LATEST_HANDSHAKE_PROTOCOL_VERSION);
     }
 }

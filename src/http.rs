@@ -12,6 +12,14 @@
 //! `initialize` creates a session; its id comes back in the `Mcp-Session-Id`
 //! header, which the client sends with every later request.
 //!
+//! Clients on protocol revision 2026-07-28 have no session: each POST holds
+//! one request carrying its protocol version and capabilities in `_meta`,
+//! and must have matching `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`
+//! and `Mcp-Param-*` headers (else `400` with a `HeaderMismatch` error).
+//! Closing a response stream cancels its request. Change notifications come
+//! on the stream answering `subscriptions/listen`, which stays open. Both
+//! kinds of clients can use the same endpoint.
+//!
 //! Serve it with [`StreamableHttp::serve`], or route requests to
 //! [`StreamableHttp::handle`] from your own hyper/axum server.
 //!
@@ -19,12 +27,14 @@
 
 use crate::error::Result;
 use crate::jsonrpc::{self, ErrorObject, Message, RequestId};
+use crate::server::stateless;
 use crate::server::{Outbound, Outlet, Server, Session};
-use crate::types::SUPPORTED_PROTOCOL_VERSIONS;
+use crate::types::{SUPPORTED_PROTOCOL_VERSIONS, is_stateless_protocol_version};
 use bytes::Bytes;
-use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -279,7 +289,8 @@ impl StreamableHttp {
         if let Some(v) = req.headers().get(PROTOCOL_VERSION_HEADER)
             && !SUPPORTED_PROTOCOL_VERSIONS.iter().any(|s| v.as_bytes() == s.as_bytes())
         {
-            return rpc_error(StatusCode::BAD_REQUEST, "Bad Request: unsupported protocol version");
+            let error = ErrorObject::unsupported_protocol_version(&String::from_utf8_lossy(v.as_bytes()));
+            return json_body(StatusCode::BAD_REQUEST, &Message::error(None, error), None);
         }
         match *req.method() {
             Method::POST => self.post(req).await,
@@ -373,6 +384,30 @@ impl StreamableHttp {
         }
         let auth = crate::auth::from_extensions(&parts.extensions);
 
+        // Protocol 2026-07-28+: no session, one message per POST.
+        let stateless = messages.iter().any(|m| match m {
+            Message::Request(r) => stateless::is_stateless_request(&r.method, r.params.as_ref()),
+            _ => false,
+        });
+        if stateless {
+            let Some(Message::Request(req)) = messages.pop().filter(|_| messages.is_empty() && !batch) else {
+                return rpc_error(StatusCode::BAD_REQUEST, "Bad Request: send one request per POST");
+            };
+            return self.post_stateless(&parts.headers, req, use_sse, auth).await;
+        }
+        let modern_header = parts
+            .headers
+            .get(PROTOCOL_VERSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_stateless_protocol_version);
+        if modern_header
+            && !parts.headers.contains_key(SESSION_ID_HEADER)
+            && messages.iter().all(|m| matches!(m, Message::Notification(_)))
+        {
+            // Nothing to do: notifications/cancelled isn't used over HTTP.
+            return empty(StatusCode::ACCEPTED);
+        }
+
         let initializing = messages.iter().any(|m| matches!(m, Message::Request(r) if r.method == "initialize"));
         let session = if initializing {
             if messages.len() > 1 {
@@ -456,6 +491,236 @@ impl StreamableHttp {
         session.session.close();
         empty(StatusCode::OK)
     }
+
+    /// Answer a request of a stateless revision (2026-07-28+): it gets a
+    /// session of its own, which ends with the response, or when the client
+    /// closes the stream (which cancels the request).
+    async fn post_stateless(
+        &self,
+        headers: &HeaderMap,
+        req: jsonrpc::Request,
+        use_sse: bool,
+        auth: Option<Arc<crate::auth::AuthInfo>>,
+    ) -> Response<McpBody> {
+        let id = req.id.clone();
+        let reject = |status, error| json_body(status, &Message::error(Some(id.clone()), error), None);
+        let meta = match stateless::parse_meta(req.params.as_ref()) {
+            Ok(meta) => meta,
+            Err(e) => return reject(StatusCode::BAD_REQUEST, e),
+        };
+        if let Err(e) = self.check_headers(headers, &req, meta.version) {
+            return reject(StatusCode::BAD_REQUEST, e);
+        }
+        // The listen stream only makes sense as SSE.
+        let use_sse = use_sse || req.method == "subscriptions/listen";
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outlet = Outlet::Channel(tx);
+        let session = Session::detached(self.server.clone(), outlet.clone());
+        crate::auth::scope(auth, || session.handle(Message::Request(req), &outlet));
+        drop(outlet);
+
+        // Wait for the first message, to pick the HTTP status of errors.
+        let first = tokio::select! {
+            out = rx.recv() => out,
+            _ = session.closed() => None,
+        };
+        let first = match first {
+            Some(Outbound::Message(msg)) => msg,
+            _ => {
+                session.close();
+                return empty(StatusCode::ACCEPTED);
+            }
+        };
+        if let Message::Error(e) = &first {
+            let status = match e.error.code {
+                jsonrpc::METHOD_NOT_FOUND => Some(StatusCode::NOT_FOUND),
+                jsonrpc::HEADER_MISMATCH
+                | jsonrpc::MISSING_REQUIRED_CLIENT_CAPABILITY
+                | jsonrpc::UNSUPPORTED_PROTOCOL_VERSION => Some(StatusCode::BAD_REQUEST),
+                _ => None,
+            };
+            if let Some(status) = status {
+                session.close();
+                return json_body(status, &first, None);
+            }
+        }
+        if use_sse {
+            let (body_tx, body_rx) = mpsc::channel(16);
+            tokio::spawn(stream_stateless(first, rx, id, body_tx, session, self.settings.keepalive));
+            return sse_response(body_rx, None);
+        }
+        // JSON: skip related notifications, they have nowhere to go.
+        let mut msg = Some(first);
+        while let Some(m) = msg.take() {
+            if m.response_id() == Some(&id) {
+                session.close();
+                return json_body(StatusCode::OK, &m, None);
+            }
+            msg = tokio::select! {
+                out = rx.recv() => match out {
+                    Some(Outbound::Message(m)) => Some(m),
+                    _ => None,
+                },
+                _ = session.closed() => None,
+            };
+        }
+        session.close();
+        empty(StatusCode::ACCEPTED)
+    }
+
+    /// Check the headers a stateless request must carry against its body:
+    /// `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` and the
+    /// `Mcp-Param-*` headers of tool parameters marked with `x-mcp-header`.
+    fn check_headers(&self, headers: &HeaderMap, req: &jsonrpc::Request, version: &str) -> Result<(), ErrorObject> {
+        let get = |name: &str| -> Result<Option<String>, ErrorObject> {
+            match headers.get(name) {
+                None => Ok(None),
+                Some(v) => match v.to_str() {
+                    Ok(v) => decode_header_value(v)
+                        .map(Some)
+                        .ok_or_else(|| ErrorObject::header_mismatch(format!("Header mismatch: invalid {name} header"))),
+                    Err(_) => Err(ErrorObject::header_mismatch(format!("Header mismatch: invalid {name} header"))),
+                },
+            }
+        };
+        let expect = |name: &str, body: &str| -> Result<(), ErrorObject> {
+            match get(name)? {
+                Some(v) if v == body => Ok(()),
+                Some(v) => Err(ErrorObject::header_mismatch(format!(
+                    "Header mismatch: {name} header value '{v}' does not match body value '{body}'"
+                ))),
+                None => Err(ErrorObject::header_mismatch(format!("Header mismatch: missing {name} header"))),
+            }
+        };
+        // Decoding doesn't apply to these, but they never look encoded.
+        expect(PROTOCOL_VERSION_HEADER, version)?;
+        expect(METHOD_HEADER, &req.method)?;
+        let param = |key: &str| req.params.as_ref().and_then(|p| p.get(key)).and_then(Value::as_str).unwrap_or("");
+        match req.method.as_str() {
+            "tools/call" | "prompts/get" => expect(NAME_HEADER, param("name"))?,
+            "resources/read" => expect(NAME_HEADER, param("uri"))?,
+            _ => {}
+        }
+        if req.method != "tools/call" {
+            return Ok(());
+        }
+        let Some(schema) = self.server.tool_input_schema(param("name")) else {
+            return Ok(());
+        };
+        let args = req.params.as_ref().and_then(|p| p.get("arguments"));
+        let mut marked = Vec::new();
+        header_params(&schema, &mut Vec::new(), &mut marked);
+        for (path, name) in marked {
+            let header = format!("mcp-param-{}", name.to_ascii_lowercase());
+            let value = args.and_then(|a| path.iter().try_fold(a, |v, key| v.get(key))).filter(|v| !v.is_null());
+            let given = get(&header)?;
+            let matches = match (value, &given) {
+                (None, None) => true,
+                (Some(Value::String(s)), Some(h)) => s == h,
+                (Some(Value::Bool(b)), Some(h)) => h == if *b { "true" } else { "false" },
+                (Some(Value::Number(n)), Some(h)) => h.trim().parse::<f64>().ok() == n.as_f64(),
+                // Not a primitive: the annotation is invalid, ignore it.
+                (Some(v), None) if !(v.is_string() || v.is_boolean() || v.is_number()) => true,
+                _ => false,
+            };
+            if !matches {
+                return Err(ErrorObject::header_mismatch(format!(
+                    "Header mismatch: Mcp-Param-{name} header does not match argument {}",
+                    path.join(".")
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `Mcp-Method` header (2026-07-28+).
+pub const METHOD_HEADER: &str = "mcp-method";
+/// `Mcp-Name` header (2026-07-28+).
+pub const NAME_HEADER: &str = "mcp-name";
+
+/// The parameters of a tool's input schema marked with `x-mcp-header`,
+/// reachable through `properties` only: their path and header name.
+fn header_params(schema: &Value, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, String)>) {
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else { return };
+    for (key, prop) in props {
+        path.push(key.clone());
+        if let Some(name) = prop.get("x-mcp-header").and_then(Value::as_str) {
+            out.push((path.clone(), name.to_string()));
+        }
+        header_params(prop, path, out);
+        path.pop();
+    }
+}
+
+/// A header value, decoded if it uses the `=?base64?...?=` form.
+fn decode_header_value(v: &str) -> Option<String> {
+    match v.strip_prefix("=?base64?").and_then(|v| v.strip_suffix("?=")) {
+        Some(encoded) => String::from_utf8(base64_decode(encoded)?).ok(),
+        None => Some(v.to_string()),
+    }
+}
+
+/// Decode standard base64 (padding optional).
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.trim_end_matches('=').bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Forward a stateless request's messages to its SSE stream until its
+/// response; a stream closed by the client cancels the request.
+async fn stream_stateless(
+    first: Message,
+    mut rx: mpsc::UnboundedReceiver<Outbound>,
+    id: RequestId,
+    body: mpsc::Sender<Bytes>,
+    session: Session,
+    keepalive: Duration,
+) {
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
+    let mut next = Some(first);
+    loop {
+        let msg = match next.take() {
+            Some(msg) => msg,
+            None => tokio::select! {
+                out = rx.recv() => match out {
+                    Some(Outbound::Message(msg)) => msg,
+                    _ => break,
+                },
+                _ = body.closed() => break,
+                _ = session.closed() => break,
+                _ = tick.tick() => {
+                    if body.send(Bytes::from_static(b": keepalive\n\n")).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            },
+        };
+        let last = msg.response_id() == Some(&id);
+        if body.send(sse_event(&msg)).await.is_err() || last {
+            break;
+        }
+    }
+    session.close();
 }
 
 async fn sweep(state: Weak<State>, timeout: Duration) {
@@ -663,5 +928,6 @@ fn json_body(status: StatusCode, value: &impl serde::Serialize, session_id: Opti
 fn sse_response(rx: mpsc::Receiver<Bytes>, session_id: Option<&str>) -> Response<McpBody> {
     let mut res = response(StatusCode::OK, Some("text/event-stream"), McpBody(BodyKind::Stream(rx)));
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    res.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
     with_session_id(res, session_id)
 }

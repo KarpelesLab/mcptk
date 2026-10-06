@@ -1,6 +1,8 @@
 //! A server's connection with one client, and request handling.
 
 use super::Server;
+use super::input::InputState;
+use super::stateless::{self, RequestMeta};
 use crate::channel::{self, ChannelEvent, PermissionVerdict};
 use crate::error::{Error, Result};
 use crate::jsonrpc::{ErrorObject, Message, Notification, Request, RequestId};
@@ -10,6 +12,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
@@ -64,11 +67,29 @@ pub(crate) struct SessionInner {
     closed: CancellationToken,
 }
 
+impl SessionInner {
+    /// Whether the client subscribed to `uri` with `resources/subscribe`.
+    pub(crate) fn subscribed(&self, uri: &str) -> bool {
+        self.subscriptions.lock().unwrap().contains(uri)
+    }
+}
+
+/// Most times a handler is run again with client input, for one request.
+const MAX_INPUT_ROUNDS: usize = 16;
+
 /// One client's session with the server. Cheap to clone.
 ///
 /// Use it to send the client notifications (channel events, logs, list
 /// changes) and requests (sampling, elicitation, roots), and to keep
 /// per-session state with [`Session::set_data`].
+///
+/// A session is a connection: one stdio stream, or one `Mcp-Session-Id` over
+/// HTTP. Clients on protocol 2026-07-28 have no session: their requests
+/// carry everything in `_meta` (see [`RequestContext`]), and don't initialize
+/// the connection they arrive on. Over HTTP, each of their requests gets a
+/// fresh session of its own. Session-wide notifications (logs, channel
+/// events, list changes) only go to initialized sessions; 2026-07-28 clients
+/// get list changes through `subscriptions/listen`.
 #[derive(Clone)]
 pub struct Session {
     pub(crate) inner: Arc<SessionInner>,
@@ -95,12 +116,29 @@ fn to_value<T: Serialize>(v: T) -> Result<Value, ErrorObject> {
     serde_json::to_value(v).map_err(|e| ErrorObject::internal(e.to_string()))
 }
 
+fn json<T: Serialize>(v: T) -> Result<Value> {
+    Ok(to_value(v)?)
+}
+
 impl Session {
     pub(crate) fn new(server: Server, outlet: Outlet) -> Session {
-        let session = Session {
+        let session = Self::create(server.clone(), outlet);
+        server.register_session(&session);
+        session
+    }
+
+    /// A session for one stateless request, not listed in
+    /// [`Server::sessions`].
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub(crate) fn detached(server: Server, outlet: Outlet) -> Session {
+        Self::create(server, outlet)
+    }
+
+    fn create(server: Server, outlet: Outlet) -> Session {
+        Session {
             inner: Arc::new(SessionInner {
                 id: random_id(),
-                server: server.clone(),
+                server,
                 outlet,
                 client: OnceLock::new(),
                 protocol_version: OnceLock::new(),
@@ -113,9 +151,7 @@ impl Session {
                 data: Mutex::new(HashMap::new()),
                 closed: CancellationToken::new(),
             }),
-        };
-        server.register_session(&session);
-        session
+        }
     }
 
     /// A random identifier (the `Mcp-Session-Id` over HTTP).
@@ -234,8 +270,16 @@ impl Session {
         Ok(serde_json::from_value(v)?)
     }
 
-    fn log_via(&self, outlet: &Outlet, level: LoggingLevel, logger: Option<&str>, data: Value) -> Result<()> {
-        if level < *self.inner.log_level.lock().unwrap() {
+    /// Send a log message if `threshold` is set and `level` is at or above it.
+    fn log_via(
+        &self,
+        outlet: &Outlet,
+        threshold: Option<LoggingLevel>,
+        level: LoggingLevel,
+        logger: Option<&str>,
+        data: Value,
+    ) -> Result<()> {
+        if threshold.is_none_or(|t| level < t) {
             return Ok(());
         }
         let mut params = json!({ "level": level, "data": data });
@@ -245,27 +289,49 @@ impl Session {
         self.send_via(outlet, Message::notification("notifications/message", Some(params)))
     }
 
+    /// Whether the client opened this session with `initialize` (a
+    /// handshake-based protocol revision).
+    fn handshake(&self) -> bool {
+        self.inner.client.get().is_some()
+    }
+
     /// Send a log message, if at or above the level the client asked for
-    /// (`info` until it asks).
+    /// (`info` until it asks). Only initialized sessions get these:
+    /// 2026-07-28 clients only get logs related to their requests (see
+    /// [`RequestContext::log`]).
     pub fn log(&self, level: LoggingLevel, logger: Option<&str>, data: impl Into<Value>) -> Result<()> {
-        self.log_via(&self.inner.outlet, level, logger, data.into())
+        let threshold = self.handshake().then(|| *self.inner.log_level.lock().unwrap());
+        self.log_via(&self.inner.outlet, threshold, level, logger, data.into())
+    }
+
+    /// Tell an initialized client, and the `subscriptions/listen` streams
+    /// opened over this connection that asked for it, that a list changed.
+    fn notify_list_changed(&self, method: &str) -> Result<()> {
+        self.inner.server.inner.listeners.notify(method, None, Some(self));
+        if !self.handshake() {
+            return Ok(());
+        }
+        self.notify(method, None)
     }
 
     pub fn notify_tools_list_changed(&self) -> Result<()> {
-        self.notify("notifications/tools/list_changed", None)
+        self.notify_list_changed("notifications/tools/list_changed")
     }
 
     pub fn notify_resources_list_changed(&self) -> Result<()> {
-        self.notify("notifications/resources/list_changed", None)
+        self.notify_list_changed("notifications/resources/list_changed")
     }
 
     pub fn notify_prompts_list_changed(&self) -> Result<()> {
-        self.notify("notifications/prompts/list_changed", None)
+        self.notify_list_changed("notifications/prompts/list_changed")
     }
 
-    /// Tell the client `uri` changed, if it subscribed to it.
+    /// Tell the client `uri` changed, if it subscribed to it (with
+    /// `resources/subscribe`, or `subscriptions/listen` over this
+    /// connection).
     pub fn notify_resource_updated(&self, uri: &str) -> Result<()> {
-        if !self.inner.subscriptions.lock().unwrap().contains(uri) {
+        self.inner.server.inner.listeners.notify("notifications/resources/updated", Some(uri), Some(self));
+        if !self.inner.subscribed(uri) {
             return Ok(());
         }
         self.notify("notifications/resources/updated", Some(json!({ "uri": uri })))
@@ -273,7 +339,13 @@ impl Session {
 
     /// Push a channel event into the session (needs
     /// [`ServerBuilder::channel`](crate::ServerBuilder::channel)).
+    ///
+    /// Channels need a handshake-based protocol revision: this fails with
+    /// [`Error::Unsupported`] until the client sent `initialize`.
     pub fn channel_event(&self, event: &ChannelEvent) -> Result<()> {
+        if !self.handshake() {
+            return Err(Error::Unsupported("channel events (they need an initialized session)"));
+        }
         self.notify(channel::CHANNEL_NOTIFICATION, Some(serde_json::to_value(event)?))
     }
 
@@ -368,6 +440,15 @@ impl Session {
         if self.is_closed() {
             return;
         }
+        // Protocol 2026-07-28+: the request carries its own protocol
+        // metadata, and needs no initialized session.
+        if req.method != "initialize" && stateless::is_stateless_request(&req.method, req.params.as_ref()) {
+            match stateless::parse_meta(req.params.as_ref()) {
+                Ok(meta) => self.spawn_request(req, reply, Some(Arc::new(meta))),
+                Err(e) => Self::respond(reply, req.id, Err(e)),
+            }
+            return;
+        }
         match req.method.as_str() {
             // Answered inline, so that the session is set up before any
             // message that follows is handled.
@@ -376,36 +457,91 @@ impl Session {
             _ if self.inner.client.get().is_none() => {
                 Self::respond(reply, req.id, Err(ErrorObject::invalid_request("session not initialized")))
             }
-            _ => {
-                let cancel = self.inner.closed.child_token();
-                self.inner.running.lock().unwrap().insert(req.id.clone(), cancel.clone());
-                let meta = req.params.as_ref().and_then(|p| p.get("_meta")).and_then(Value::as_object).cloned();
-                let ctx = RequestContext {
-                    session: self.clone(),
-                    id: req.id.clone(),
-                    meta,
-                    outlet: reply.clone(),
-                    cancel: cancel.clone(),
-                    auth: crate::auth::current(), // auth hook
-                };
-                let session = self.clone();
-                let reply = reply.clone();
-                tokio::spawn(async move {
-                    let Request { id, method, params } = req;
-                    let result = tokio::select! {
-                        r = session.route(ctx, &method, params) => Some(r),
-                        _ = cancel.cancelled() => None,
-                    };
-                    session.inner.running.lock().unwrap().remove(&id);
-                    match result {
-                        Some(r) => Self::respond(&reply, id, r),
-                        None => {
-                            reply.send(Outbound::Done(id));
-                        }
-                    }
-                });
-            }
+            _ => self.spawn_request(req, reply, None),
         }
+    }
+
+    fn spawn_request(&self, req: Request, reply: &Outlet, protocol: Option<Arc<RequestMeta>>) {
+        let cancel = self.inner.closed.child_token();
+        self.inner.running.lock().unwrap().insert(req.id.clone(), cancel.clone());
+        let meta = req.params.as_ref().and_then(|p| p.get("_meta")).and_then(Value::as_object).cloned();
+        let input = match protocol {
+            Some(_) => InputState::from_params(req.params.as_ref()),
+            None => InputState::default(),
+        };
+        let ctx = RequestContext {
+            session: self.clone(),
+            id: req.id.clone(),
+            meta,
+            protocol,
+            input: Arc::new(input),
+            outlet: reply.clone(),
+            cancel: cancel.clone(),
+            auth: crate::auth::current(), // auth hook
+        };
+        let session = self.clone();
+        let reply = reply.clone();
+        tokio::spawn(async move {
+            let Request { id, method, params } = req;
+            let is_stateless = ctx.is_stateless();
+            let result = tokio::select! {
+                r = session.route(ctx, &method, params) => Some(r),
+                _ = cancel.cancelled() => None,
+            };
+            session.inner.running.lock().unwrap().remove(&id);
+            match result {
+                Some(r) if is_stateless => {
+                    Self::respond(&reply, id, stateless::finish(&session.inner.server, &method, r))
+                }
+                Some(r) => Self::respond(&reply, id, r),
+                None => {
+                    reply.send(Outbound::Done(id));
+                }
+            }
+        });
+    }
+
+    /// Run a handler that may ask for client input ([`Error::InputRequired`]):
+    /// on stateless requests, the request is answered with an
+    /// `input_required` result; on handshake sessions, mcptk sends the input
+    /// requests to the client and runs the handler again with the answers.
+    async fn with_input<F, Fut>(&self, mut ctx: RequestContext, run: F) -> Result<Value>
+    where
+        F: Fn(RequestContext) -> Fut,
+        Fut: Future<Output = Result<Value>>,
+    {
+        for _ in 0..MAX_INPUT_ROUNDS {
+            let input = match run(ctx.clone()).await {
+                Err(Error::InputRequired(input)) => input,
+                other => return other,
+            };
+            if let Some(missing) = input.missing_capabilities(ctx.client_capabilities()) {
+                return Err(Error::Rpc(ErrorObject::missing_client_capability(missing)));
+            }
+            if input.input_requests.is_empty() && input.request_state.is_none() {
+                return Err(Error::internal("input required, but no input request nor state given"));
+            }
+            if ctx.is_stateless() {
+                return Ok(input.into_result());
+            }
+            let mut responses = JsonObject::new();
+            for (key, req) in input.input_requests {
+                let method = req.get("method").and_then(Value::as_str).unwrap_or_default();
+                let answer = self.request_via(&ctx.outlet, method, req.get("params").cloned()).await?;
+                responses.insert(key, answer);
+            }
+            ctx.input = Arc::new(InputState::new(Some(responses), input.request_state));
+        }
+        Err(Error::internal("too many rounds of client input"))
+    }
+
+    /// A `subscriptions/listen` request: acknowledge it, then deliver
+    /// notifications until it is cancelled (it never completes otherwise).
+    async fn listen(&self, ctx: &RequestContext, params: ListenParams) -> Result<Value, ErrorObject> {
+        let server = &self.inner.server;
+        let filter = stateless::honored(server, &params.notifications);
+        let _guard = server.inner.listeners.add(server, self, ctx.id.clone(), filter, ctx.outlet.clone());
+        std::future::pending().await
     }
 
     fn initialize(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
@@ -456,9 +592,29 @@ impl Session {
         if let Some(handler) = server.request_handler(method) {
             return handler(ctx, params).await.map_err(|e| e.to_error_object());
         }
+        let is_stateless = ctx.is_stateless();
+        let rpc = |e: Error| e.to_error_object();
         match method {
+            "server/discover" if is_stateless => to_value(stateless::discover(&server)),
+            "subscriptions/listen" if is_stateless => self.listen(&ctx, parse(params)?).await,
+            // Removed in 2026-07-28.
+            "ping" | "logging/setLevel" | "resources/subscribe" | "resources/unsubscribe" if is_stateless => {
+                Err(ErrorObject::method_not_found(method))
+            }
             "tools/list" => to_value(ListToolsResult { tools: server.list_tools(self), next_cursor: None }),
-            "tools/call" => server.route_tool_call(ctx, parse(params)?).await,
+            "tools/call" => {
+                let p: CallToolParams = parse(params)?;
+                let run = |ctx| {
+                    let (server, p) = (server.clone(), p.clone());
+                    async move { server.route_tool_call(ctx, p).await }
+                };
+                let mut result = self.with_input(ctx, run).await.map_err(rpc)?;
+                // Before 2026-07-28, structured content had to be an object.
+                if !is_stateless && result.get("structuredContent").is_some_and(|s| !s.is_object()) {
+                    result.as_object_mut().map(|r| r.remove("structuredContent"));
+                }
+                Ok(result)
+            }
             "resources/list" => to_value(ListResourcesResult { resources: server.list_resources(), next_cursor: None }),
             "resources/templates/list" => to_value(ListResourceTemplatesResult {
                 resource_templates: server.list_resource_templates(),
@@ -466,7 +622,11 @@ impl Session {
             }),
             "resources/read" => {
                 let p: ReadResourceParams = parse(params)?;
-                to_value(server.read_resource(ctx, p.uri).await.map_err(|e| e.to_error_object())?)
+                let run = |ctx| {
+                    let (server, uri) = (server.clone(), p.uri.clone());
+                    async move { json(server.read_resource(ctx, uri).await?) }
+                };
+                self.with_input(ctx, run).await.map_err(rpc)
             }
             "resources/subscribe" => {
                 let p: ReadResourceParams = parse(params)?;
@@ -479,7 +639,14 @@ impl Session {
                 Ok(json!({}))
             }
             "prompts/list" => to_value(ListPromptsResult { prompts: server.list_prompts(), next_cursor: None }),
-            "prompts/get" => to_value(server.get_prompt(ctx, parse(params)?).await.map_err(|e| e.to_error_object())?),
+            "prompts/get" => {
+                let p: GetPromptParams = parse(params)?;
+                let run = |ctx| {
+                    let (server, p) = (server.clone(), p.clone());
+                    async move { json(server.get_prompt(ctx, p).await?) }
+                };
+                self.with_input(ctx, run).await.map_err(rpc)
+            }
             "logging/setLevel" => {
                 let p: SetLevelParams = parse(params)?;
                 *self.inner.log_level.lock().unwrap() = p.level;
@@ -496,11 +663,22 @@ impl Session {
 
 /// The context of a request being handled: its session, cancellation, and
 /// a way to send progress, logs and nested requests along with the response.
+///
+/// Handlers don't need to care which protocol revision the client speaks:
+/// [`client_info`](Self::client_info) and
+/// [`client_capabilities`](Self::client_capabilities) come from the request
+/// itself (2026-07-28) or from the session's `initialize`, and
+/// [`elicit`](Self::elicit), [`create_message`](Self::create_message) and
+/// [`list_roots`](Self::list_roots) use multi round-trip requests or
+/// server-to-client requests as needed.
 #[derive(Clone)]
 pub struct RequestContext {
     session: Session,
     id: RequestId,
     meta: Option<JsonObject>,
+    /// Set for stateless (2026-07-28+) requests.
+    protocol: Option<Arc<RequestMeta>>,
+    input: Arc<InputState>,
     outlet: Outlet,
     cancel: CancellationToken,
     /// Who the request is authenticated as (see `crate::auth`).
@@ -508,6 +686,8 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    /// The session (connection) the request came in on. Stateless requests
+    /// over HTTP each get a fresh one.
     pub fn session(&self) -> &Session {
         &self.session
     }
@@ -521,9 +701,61 @@ impl RequestContext {
         self.meta.as_ref()
     }
 
-    /// The progress token, if the client wants progress notifications.
-    pub fn progress_token(&self) -> Option<&Value> {
-        self.meta.as_ref().and_then(|m| m.get("progressToken"))
+    /// Whether the request carries its own protocol metadata (revision
+    /// 2026-07-28 and later) rather than belonging to an initialized session.
+    pub fn is_stateless(&self) -> bool {
+        self.protocol.is_some()
+    }
+
+    /// The protocol revision of this request.
+    pub fn protocol_version(&self) -> Option<&'static str> {
+        match &self.protocol {
+            Some(p) => Some(p.version),
+            None => self.session.protocol_version(),
+        }
+    }
+
+    /// The client's name and version, from the request or the session.
+    pub fn client_info(&self) -> Option<&Implementation> {
+        match &self.protocol {
+            Some(p) => p.client_info.as_ref(),
+            None => self.session.client_info(),
+        }
+    }
+
+    /// What the client supports, from the request or the session.
+    pub fn client_capabilities(&self) -> Option<&ClientCapabilities> {
+        match &self.protocol {
+            Some(p) => Some(&p.capabilities),
+            None => self.session.client_capabilities(),
+        }
+    }
+
+    /// The lowest level [`log`](Self::log) sends, if any: the request's
+    /// `io.modelcontextprotocol/logLevel`, or the session's level.
+    pub fn log_level(&self) -> Option<LoggingLevel> {
+        match &self.protocol {
+            Some(p) => p.log_level,
+            None => Some(*self.session.inner.log_level.lock().unwrap()),
+        }
+    }
+
+    /// The client's answers to an [`InputRequired`](crate::InputRequired),
+    /// by key (`inputResponses`), when this run follows one.
+    pub fn input_responses(&self) -> Option<&JsonObject> {
+        self.input.responses()
+    }
+
+    /// The client's answer to the input request `key`, if given; e.g. an
+    /// [`ElicitResult`] for an elicitation.
+    pub fn input_response<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        self.input.response(key)
+    }
+
+    /// The `requestState` of the [`InputRequired`](crate::InputRequired)
+    /// this run follows. It went through the client: don't trust it.
+    pub fn request_state(&self) -> Option<&str> {
+        self.input.state()
     }
 
     /// Whether the client cancelled the request (or the session ended).
@@ -535,6 +767,11 @@ impl RequestContext {
 
     pub async fn cancelled(&self) {
         self.cancel.cancelled().await
+    }
+
+    /// The progress token, if the client wants progress notifications.
+    pub fn progress_token(&self) -> Option<&Value> {
+        self.meta.as_ref().and_then(|m| m.get("progressToken"))
     }
 
     /// Report progress, if the client asked for it. `progress` must increase
@@ -558,33 +795,74 @@ impl RequestContext {
         self.session.send_via(&self.outlet, Message::notification(method, params))
     }
 
-    /// Send a log message related to this request.
+    /// Send a log message related to this request, if at or above
+    /// [`log_level`](Self::log_level). Stateless requests only get logs when
+    /// they ask with `io.modelcontextprotocol/logLevel`.
     pub fn log(&self, level: LoggingLevel, logger: Option<&str>, data: impl Into<Value>) -> Result<()> {
-        self.session.log_via(&self.outlet, level, logger, data.into())
+        self.session.log_via(&self.outlet, self.log_level(), level, logger, data.into())
     }
 
     /// Send a request to the client, related to this request.
+    ///
+    /// Stateless requests (2026-07-28) can't: the server asks for input with
+    /// an [`InputRequired`](crate::InputRequired) instead. This fails with
+    /// [`Error::Unsupported`] for them.
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        if self.is_stateless() {
+            return Err(Error::Unsupported("server-to-client requests (use InputRequired)"));
+        }
         self.session.request_via(&self.outlet, method, params).await
+    }
+
+    fn require(&self, what: &'static str, has: impl Fn(&ClientCapabilities) -> bool) -> Result<()> {
+        match self.client_capabilities() {
+            Some(c) if has(c) => Ok(()),
+            _ => Err(Error::Unsupported(what)),
+        }
+    }
+
+    /// Send a request to the client and wait for its answer, or on stateless
+    /// requests, take the answer from the client's retry (or fail with the
+    /// [`Error::InputRequired`] that asks for it).
+    pub(crate) async fn ask<T: DeserializeOwned>(&self, method: &str, params: impl Serialize) -> Result<T> {
+        if self.is_stateless() {
+            return self.input.next(method, serde_json::to_value(params)?);
+        }
+        self.session.request_as(&self.outlet, method, params).await
     }
 
     /// Ask the client's LLM for a completion (sampling). Requests with tools
     /// need the client's `sampling.tools` capability.
+    ///
+    /// On stateless requests (2026-07-28) this is a multi round-trip
+    /// request: the first time, it fails with [`Error::InputRequired`]. Let
+    /// it propagate with `?` (tool handlers too): the client then retries
+    /// the request with the answer, and this call returns it. The handler
+    /// runs again from the start each time, so it must make its
+    /// `create_message`, `elicit` and `list_roots` calls in the same order.
     pub async fn create_message(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
-        self.session.require_sampling(&params)?;
-        self.session.request_as(&self.outlet, "sampling/createMessage", params).await
+        self.require("sampling", |c| c.sampling.is_some())?;
+        if params.uses_tools() {
+            self.require("sampling with tools", ClientCapabilities::supports_sampling_tools)?;
+        }
+        self.ask("sampling/createMessage", params).await
     }
 
     /// Ask the user for input (elicitation). URL mode needs the client's
-    /// `elicitation.url` capability.
+    /// `elicitation.url` capability. See
+    /// [`create_message`](Self::create_message) for stateless requests.
     pub async fn elicit(&self, params: ElicitParams) -> Result<ElicitResult> {
-        self.session.require_elicitation(&params)?;
-        self.session.request_as(&self.outlet, "elicitation/create", params).await
+        match &params {
+            ElicitParams::Form(_) => self.require("elicitation", ClientCapabilities::supports_elicitation_form)?,
+            ElicitParams::Url(_) => self.require("URL elicitation", ClientCapabilities::supports_elicitation_url)?,
+        }
+        self.ask("elicitation/create", params).await
     }
 
-    /// The client's roots.
+    /// The client's roots. See [`create_message`](Self::create_message) for
+    /// stateless requests.
     pub async fn list_roots(&self) -> Result<ListRootsResult> {
-        self.session.require("roots", |c| c.roots.is_some())?;
-        self.session.request_as(&self.outlet, "roots/list", json!({})).await
+        self.require("roots", |c| c.roots.is_some())?;
+        self.ask("roots/list", json!({})).await
     }
 }
