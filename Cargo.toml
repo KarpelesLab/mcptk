@@ -10,6 +10,9 @@ readme = "README.md"
 keywords = ["mcp", "ai", "agent", "jsonrpc", "llm"]
 categories = ["network-programming", "asynchronous"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["stdio", "http", "schemars"]
 # Serve over stdin/stdout (and any AsyncRead/AsyncWrite pair).
