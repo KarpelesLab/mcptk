@@ -17,6 +17,8 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 /// MCP: the requested resource does not exist.
 pub const RESOURCE_NOT_FOUND: i64 = -32002;
+/// MCP (2025-11-25+): the request needs URL mode elicitations completed first.
+pub const URL_ELICITATION_REQUIRED: i64 = -32042;
 
 /// A request id: a string or an integer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -94,6 +96,15 @@ impl ErrorObject {
 
     pub fn resource_not_found(uri: &str) -> Self {
         Self::new(RESOURCE_NOT_FOUND, "resource not found").with_data(serde_json::json!({ "uri": uri }))
+    }
+
+    /// The request can't go on until the user completes these URL mode
+    /// elicitations; the client may retry it after that (2025-11-25+).
+    pub fn url_elicitation_required(
+        message: impl Into<String>,
+        elicitations: Vec<crate::types::ElicitUrlParams>,
+    ) -> Self {
+        Self::new(URL_ELICITATION_REQUIRED, message).with_data(serde_json::json!({ "elicitations": elicitations }))
     }
 }
 

@@ -116,6 +116,31 @@ pub struct ClientCapabilities {
     pub extensions: Option<JsonObject>,
 }
 
+impl ClientCapabilities {
+    fn has_sub(capability: &Option<Value>, name: &str) -> bool {
+        capability.as_ref().and_then(|c| c.get(name)).is_some_and(|v| !v.is_null())
+    }
+
+    /// Whether the client accepts form mode elicitation: `elicitation: {}`
+    /// (form only, as before 2025-11-25) or `elicitation: {form: {}}`.
+    pub fn supports_elicitation_form(&self) -> bool {
+        self.elicitation.is_some()
+            && (Self::has_sub(&self.elicitation, "form") || !Self::has_sub(&self.elicitation, "url"))
+    }
+
+    /// Whether the client accepts URL mode elicitation:
+    /// `elicitation: {url: {}}` (2025-11-25+).
+    pub fn supports_elicitation_url(&self) -> bool {
+        Self::has_sub(&self.elicitation, "url")
+    }
+
+    /// Whether the client accepts tools in sampling requests:
+    /// `sampling: {tools: {}}` (2025-11-25+).
+    pub fn supports_sampling_tools(&self) -> bool {
+        Self::has_sub(&self.sampling, "tools")
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
@@ -348,6 +373,40 @@ impl Tool {
         self.meta.get_or_insert_with(JsonObject::new).insert(key.into(), value.into());
         self
     }
+
+    /// Claude Code: let this tool's text results reach `chars` characters
+    /// (capped at [`anthropic::MAX_RESULT_SIZE_CHARS_LIMIT`]) before they are
+    /// saved to a file instead of shown inline.
+    pub fn max_result_size_chars(self, chars: u32) -> Self {
+        self.meta(anthropic::MAX_RESULT_SIZE_CHARS, chars.min(anthropic::MAX_RESULT_SIZE_CHARS_LIMIT))
+    }
+
+    /// Claude Code: ask the user for permission on every call of this tool,
+    /// even in bypass modes and despite allow rules.
+    pub fn requires_user_interaction(self) -> Self {
+        self.meta(anthropic::REQUIRES_USER_INTERACTION, true)
+    }
+
+    /// Claude Code: load this tool upfront instead of deferring it behind
+    /// tool search.
+    pub fn always_load(self) -> Self {
+        self.meta(anthropic::ALWAYS_LOAD, true)
+    }
+}
+
+/// Claude Code's `_meta` keys for tools, see
+/// <https://code.claude.com/docs/en/mcp>.
+pub mod anthropic {
+    /// A number of characters: how large the tool's text results may be before
+    /// Claude Code saves them to a file (default 50,000).
+    pub const MAX_RESULT_SIZE_CHARS: &str = "anthropic/maxResultSizeChars";
+    /// Claude Code's ceiling for [`MAX_RESULT_SIZE_CHARS`].
+    pub const MAX_RESULT_SIZE_CHARS_LIMIT: u32 = 500_000;
+    /// `true`: Claude Code asks for permission on every call of the tool.
+    pub const REQUIRES_USER_INTERACTION: &str = "anthropic/requiresUserInteraction";
+    /// `true`: Claude Code loads the tool upfront rather than through tool
+    /// search.
+    pub const ALWAYS_LOAD: &str = "anthropic/alwaysLoad";
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -576,6 +635,8 @@ pub struct ReadResourceParams {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReadResourceResult {
     pub contents: Vec<ResourceContents>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<JsonObject>,
 }
 
 /// An argument a prompt accepts.
@@ -659,6 +720,8 @@ pub struct GetPromptResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub messages: Vec<PromptMessage>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<JsonObject>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -741,11 +804,183 @@ pub struct CompleteResult {
     pub completion: Completion,
 }
 
+/// The model asking to call a tool (sampling with tools, 2025-11-25+).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolUseContent {
+    /// Identifies this tool use; the matching result's `toolUseId`.
+    pub id: String,
+    pub name: String,
+    pub input: JsonObject,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<JsonObject>,
+}
+
+/// The result of a tool use, sent back to the model (sampling with tools,
+/// 2025-11-25+).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolResultContent {
+    /// The `id` of the [`ToolUseContent`] this answers.
+    pub tool_use_id: String,
+    pub content: Vec<Content>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<JsonObject>,
+}
+
+/// A piece of content in a sampling message.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SamplingContent {
+    Text(TextContent),
+    Image(MediaContent),
+    Audio(MediaContent),
+    /// In assistant messages: the model wants a tool called.
+    ToolUse(ToolUseContent),
+    /// In user messages: the result of a tool use. A message holding tool
+    /// results must hold nothing else.
+    ToolResult(ToolResultContent),
+}
+
+impl SamplingContent {
+    pub fn text(text: impl Into<String>) -> Self {
+        SamplingContent::Text(TextContent { text: text.into(), ..Default::default() })
+    }
+
+    pub fn image(base64_data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        SamplingContent::Image(MediaContent {
+            data: base64_data.into(),
+            mime_type: mime_type.into(),
+            ..Default::default()
+        })
+    }
+
+    pub fn audio(base64_data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        SamplingContent::Audio(MediaContent {
+            data: base64_data.into(),
+            mime_type: mime_type.into(),
+            ..Default::default()
+        })
+    }
+
+    pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: JsonObject) -> Self {
+        SamplingContent::ToolUse(ToolUseContent { id: id.into(), name: name.into(), input, meta: None })
+    }
+
+    pub fn tool_result(tool_use_id: impl Into<String>, content: Vec<Content>) -> Self {
+        SamplingContent::ToolResult(ToolResultContent {
+            tool_use_id: tool_use_id.into(),
+            content,
+            ..Default::default()
+        })
+    }
+
+    /// The text, if this is text content.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            SamplingContent::Text(t) => Some(&t.text),
+            _ => None,
+        }
+    }
+
+    fn is_tool_related(&self) -> bool {
+        matches!(self, SamplingContent::ToolUse(_) | SamplingContent::ToolResult(_))
+    }
+}
+
+/// Sampling content is a single block or an array of them on the wire; a
+/// single block is sent as an object, so that older clients understand it.
+mod one_or_many {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T: Serialize, S: Serializer>(items: &[T], s: S) -> Result<S::Ok, S::Error> {
+        match items {
+            [one] => one.serialize(s),
+            many => many.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<Vec<T>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany<T> {
+            Many(Vec<T>),
+            One(T),
+        }
+        Ok(match OneOrMany::deserialize(d)? {
+            OneOrMany::Many(v) => v,
+            OneOrMany::One(t) => vec![t],
+        })
+    }
+}
+
 /// A message for, or from, the client's LLM (sampling).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SamplingMessage {
     pub role: Role,
-    pub content: Content,
+    /// One or more blocks (several are sent as an array, 2025-11-25+).
+    #[serde(with = "one_or_many")]
+    pub content: Vec<SamplingContent>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<JsonObject>,
+}
+
+impl SamplingMessage {
+    pub fn new(role: Role, content: Vec<SamplingContent>) -> Self {
+        SamplingMessage { role, content, meta: None }
+    }
+
+    /// A user message with some text.
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::new(Role::User, vec![SamplingContent::text(text)])
+    }
+
+    /// An assistant message with some text.
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::new(Role::Assistant, vec![SamplingContent::text(text)])
+    }
+
+    /// A user message answering tool uses (it must hold only tool results).
+    pub fn tool_results(results: Vec<ToolResultContent>) -> Self {
+        Self::new(Role::User, results.into_iter().map(SamplingContent::ToolResult).collect())
+    }
+}
+
+/// How the model may use the tools of a sampling request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoiceMode {
+    /// The model decides (the default).
+    Auto,
+    /// The model must use at least one tool.
+    Required,
+    /// The model must not use tools.
+    None,
+}
+
+/// `toolChoice` in a sampling request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolChoice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ToolChoiceMode>,
+}
+
+impl ToolChoice {
+    pub fn auto() -> Self {
+        ToolChoice { mode: Some(ToolChoiceMode::Auto) }
+    }
+
+    pub fn required() -> Self {
+        ToolChoice { mode: Some(ToolChoiceMode::Required) }
+    }
+
+    pub fn none() -> Self {
+        ToolChoice { mode: Some(ToolChoiceMode::None) }
+    }
 }
 
 /// `sampling/createMessage` parameters: ask the client's LLM for a completion.
@@ -766,25 +1001,143 @@ pub struct CreateMessageParams {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// Tools the model may call (2025-11-25+; needs the client's
+    /// `sampling.tools` capability).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+}
+
+impl CreateMessageParams {
+    /// Whether this is a tool-enabled request: it offers tools, sets a tool
+    /// choice, or carries tool uses or results.
+    pub fn uses_tools(&self) -> bool {
+        self.tools.is_some()
+            || self.tool_choice.is_some()
+            || self.messages.iter().flat_map(|m| &m.content).any(SamplingContent::is_tool_related)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateMessageResult {
     pub role: Role,
-    pub content: Content,
+    /// One or more blocks; several tool uses may come at once.
+    #[serde(with = "one_or_many")]
+    pub content: Vec<SamplingContent>,
     pub model: String,
+    /// `endTurn`, `stopSequence`, `maxTokens`, `toolUse`, or a
+    /// provider-specific reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<JsonObject>,
 }
 
-/// `elicitation/create` parameters: ask the user for structured input.
+impl CreateMessageResult {
+    /// The first text block, if any.
+    pub fn text(&self) -> Option<&str> {
+        self.content.iter().find_map(SamplingContent::as_text)
+    }
+
+    /// The tool uses the model asks for.
+    pub fn tool_uses(&self) -> impl Iterator<Item = &ToolUseContent> {
+        self.content.iter().filter_map(|c| match c {
+            SamplingContent::ToolUse(t) => Some(t),
+            _ => None,
+        })
+    }
+}
+
+/// Form mode elicitation: ask the user for structured data, through the
+/// client. Not for secrets (use URL mode).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ElicitParams {
+pub struct ElicitFormParams {
     pub message: String,
     /// A flat object schema of primitive properties.
     pub requested_schema: Value,
+}
+
+/// URL mode elicitation (2025-11-25+): send the user to a URL for an
+/// interaction the client must not see, such as entering credentials or a
+/// third-party OAuth flow. Serialized with `"mode": "url"`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "mode", rename = "url")]
+pub struct ElicitUrlParams {
+    pub message: String,
+    /// Identifies the elicitation, in `notifications/elicitation/complete`.
+    pub elicitation_id: String,
+    pub url: String,
+}
+
+/// `elicitation/create` parameters: ask the user for input, in form or URL
+/// mode.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ElicitParams {
+    Form(ElicitFormParams),
+    Url(ElicitUrlParams),
+}
+
+impl ElicitParams {
+    /// Ask for data matching `requested_schema`, a flat object schema of
+    /// primitive properties.
+    pub fn form(message: impl Into<String>, requested_schema: Value) -> Self {
+        ElicitParams::Form(ElicitFormParams { message: message.into(), requested_schema })
+    }
+
+    /// Send the user to `url`. Use a fresh, unique `elicitation_id`, and bind
+    /// it to the user, not just the session.
+    pub fn url(message: impl Into<String>, url: impl Into<String>, elicitation_id: impl Into<String>) -> Self {
+        ElicitParams::Url(ElicitUrlParams {
+            message: message.into(),
+            elicitation_id: elicitation_id.into(),
+            url: url.into(),
+        })
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            ElicitParams::Form(p) => &p.message,
+            ElicitParams::Url(p) => &p.message,
+        }
+    }
+}
+
+impl From<ElicitFormParams> for ElicitParams {
+    fn from(p: ElicitFormParams) -> Self {
+        ElicitParams::Form(p)
+    }
+}
+
+impl From<ElicitUrlParams> for ElicitParams {
+    fn from(p: ElicitUrlParams) -> Self {
+        ElicitParams::Url(p)
+    }
+}
+
+// Form mode goes without `mode`, which every revision understands.
+impl Serialize for ElicitParams {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ElicitParams::Form(p) => p.serialize(s),
+            ElicitParams::Url(p) => p.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ElicitParams {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let v = Value::deserialize(d)?;
+        match v.get("mode").and_then(Value::as_str) {
+            None | Some("form") => serde_json::from_value(v).map(ElicitParams::Form),
+            Some("url") => serde_json::from_value(v).map(ElicitParams::Url),
+            Some(other) => return Err(D::Error::custom(format!("unknown elicitation mode: {other}"))),
+        }
+        .map_err(D::Error::custom)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -807,6 +1160,8 @@ pub struct Root {
     pub uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<JsonObject>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -837,6 +1192,128 @@ mod tests {
         assert!(matches!(t, ResourceContents::Text { .. }));
         let b: ResourceContents = serde_json::from_value(json!({"uri":"x","blob":"AA=="})).unwrap();
         assert!(matches!(b, ResourceContents::Blob { .. }));
+    }
+
+    #[test]
+    fn anthropic_tool_meta() {
+        let tool = Tool::new("t", "d").max_result_size_chars(200_000).requires_user_interaction().always_load();
+        assert_eq!(
+            serde_json::to_value(&tool).unwrap()["_meta"],
+            json!({
+                "anthropic/maxResultSizeChars": 200000,
+                "anthropic/requiresUserInteraction": true,
+                "anthropic/alwaysLoad": true
+            })
+        );
+        let capped = Tool::new("t", "d").max_result_size_chars(u32::MAX);
+        assert_eq!(capped.meta.unwrap()[anthropic::MAX_RESULT_SIZE_CHARS], 500_000);
+    }
+
+    #[test]
+    fn elicit_params_modes() {
+        let form = ElicitParams::form("Name?", json!({"type":"object"}));
+        assert_eq!(
+            serde_json::to_value(&form).unwrap(),
+            json!({"message":"Name?","requestedSchema":{"type":"object"}})
+        );
+        let url = ElicitParams::url("Set your key", "https://example.com/key", "e1");
+        let wire = json!({"mode":"url","message":"Set your key","elicitationId":"e1","url":"https://example.com/key"});
+        assert_eq!(serde_json::to_value(&url).unwrap(), wire);
+
+        assert_eq!(serde_json::from_value::<ElicitParams>(wire).unwrap(), url);
+        let explicit_form = json!({"mode":"form","message":"Name?","requestedSchema":{"type":"object"}});
+        assert_eq!(serde_json::from_value::<ElicitParams>(explicit_form).unwrap(), form);
+        assert!(serde_json::from_value::<ElicitParams>(json!({"mode":"carrier-pigeon","message":"x"})).is_err());
+        assert!(serde_json::from_value::<ElicitParams>(json!({"mode":"url","message":"x"})).is_err());
+    }
+
+    #[test]
+    fn url_elicitation_required_error() {
+        let ElicitParams::Url(p) = ElicitParams::url("Authorize", "https://example.com/connect", "e2") else {
+            unreachable!()
+        };
+        let err = crate::jsonrpc::ErrorObject::url_elicitation_required("Needs authorization", vec![p]);
+        assert_eq!(
+            serde_json::to_value(err).unwrap(),
+            json!({"code":-32042,"message":"Needs authorization","data":{"elicitations":[
+                {"mode":"url","message":"Authorize","elicitationId":"e2","url":"https://example.com/connect"}
+            ]}})
+        );
+    }
+
+    #[test]
+    fn client_capability_helpers() {
+        let caps = |v: Value| serde_json::from_value::<ClientCapabilities>(v).unwrap();
+        let none = caps(json!({}));
+        assert!(!none.supports_elicitation_form() && !none.supports_elicitation_url());
+        let legacy = caps(json!({"elicitation": {}}));
+        assert!(legacy.supports_elicitation_form() && !legacy.supports_elicitation_url());
+        let both = caps(json!({"elicitation": {"form": {}, "url": {}}}));
+        assert!(both.supports_elicitation_form() && both.supports_elicitation_url());
+        let url_only = caps(json!({"elicitation": {"url": {}}}));
+        assert!(!url_only.supports_elicitation_form() && url_only.supports_elicitation_url());
+        assert!(!caps(json!({"sampling": {}})).supports_sampling_tools());
+        assert!(caps(json!({"sampling": {"tools": {}}})).supports_sampling_tools());
+    }
+
+    #[test]
+    fn sampling_with_tools() {
+        let params = CreateMessageParams {
+            messages: vec![
+                SamplingMessage::user("Weather in Paris?"),
+                SamplingMessage::new(
+                    Role::Assistant,
+                    vec![SamplingContent::tool_use(
+                        "call_1",
+                        "get_weather",
+                        json!({"city":"Paris"}).as_object().unwrap().clone(),
+                    )],
+                ),
+                SamplingMessage::tool_results(vec![ToolResultContent {
+                    tool_use_id: "call_1".into(),
+                    content: vec![Content::text("18°C")],
+                    ..Default::default()
+                }]),
+            ],
+            max_tokens: 100,
+            tools: Some(vec![Tool::new("get_weather", "Get the weather")]),
+            tool_choice: Some(ToolChoice::auto()),
+            ..Default::default()
+        };
+        assert!(params.uses_tools());
+        let v = serde_json::to_value(&params).unwrap();
+        // A single block stays an object, as older clients expect.
+        assert_eq!(v["messages"][0]["content"], json!({"type":"text","text":"Weather in Paris?"}));
+        assert_eq!(
+            v["messages"][1]["content"],
+            json!({"type":"tool_use","id":"call_1","name":"get_weather","input":{"city":"Paris"}})
+        );
+        assert_eq!(
+            v["messages"][2]["content"],
+            json!({"type":"tool_result","toolUseId":"call_1","content":[{"type":"text","text":"18°C"}]})
+        );
+        assert_eq!(v["tools"][0]["name"], "get_weather");
+        assert_eq!(v["toolChoice"], json!({"mode":"auto"}));
+        assert_eq!(serde_json::from_value::<CreateMessageParams>(v).unwrap(), params);
+
+        assert!(
+            !CreateMessageParams { messages: vec![SamplingMessage::user("hi")], ..Default::default() }.uses_tools()
+        );
+
+        let res: CreateMessageResult = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [
+                {"type":"tool_use","id":"a","name":"get_weather","input":{"city":"Paris"}},
+                {"type":"tool_use","id":"b","name":"get_weather","input":{"city":"London"}}
+            ],
+            "model": "m",
+            "stopReason": "toolUse"
+        }))
+        .unwrap();
+        assert_eq!(res.tool_uses().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(res.text(), None);
+        let v = serde_json::to_value(&res).unwrap();
+        assert!(v["content"].is_array());
     }
 
     #[test]

@@ -74,8 +74,10 @@ Every handler receives a `RequestContext`. Use it to:
 
 - report progress: `ctx.progress(done, Some(total), None)`
 - send logs: `ctx.log(LoggingLevel::Info, Some("db"), "connected")`
-- ask the client: `ctx.create_message(...)` (sampling),
-  `ctx.elicit(...)`, `ctx.list_roots()`
+- ask the client: `ctx.create_message(...)` (sampling, optionally with
+  `tools`), `ctx.elicit(ElicitParams::form(...))` or
+  `ctx.elicit(ElicitParams::url(...))` (then
+  `session.notify_elicitation_complete(id)`), `ctx.list_roots()`
 - check for cancellation: `ctx.is_cancelled()`. A handler's future is dropped
   when the client cancels the request.
 - reach the `Session`: `ctx.session()`, which also holds per-session state via

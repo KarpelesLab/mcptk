@@ -100,13 +100,13 @@ fn test_server() -> Server {
         .tool(Tool::new("ask", "Samples the client's LLM"), |ctx, _args| async move {
             let res = ctx
                 .create_message(CreateMessageParams {
-                    messages: vec![types::SamplingMessage { role: types::Role::User, content: Content::text("hi") }],
+                    messages: vec![types::SamplingMessage::user("hi")],
                     max_tokens: 10,
                     ..Default::default()
                 })
                 .await
                 .map_err(ToolError::msg)?;
-            Ok::<_, ToolError>(format!("model said: {}", res.content.as_text().unwrap_or("")))
+            Ok::<_, ToolError>(format!("model said: {}", res.text().unwrap_or("")))
         })
         .resource(Resource::new("mem://readme", "readme").mime_type("text/plain"), |_ctx, _uri| async move {
             Ok("hello world")
@@ -376,4 +376,140 @@ async fn end_of_input_closes_session() {
     tokio::time::timeout(Duration::from_secs(5), conn.wait()).await.unwrap().unwrap();
     assert!(session.is_closed());
     assert!(server.sessions().is_empty());
+}
+
+fn elicit_server() -> Server {
+    Server::builder("elicit", "1")
+        .tool(Tool::new("connect", "URL elicitation"), |ctx, _args| async move {
+            let res = ctx
+                .elicit(types::ElicitParams::url("Connect your account", "https://example.com/connect?id=e1", "e1"))
+                .await
+                .map_err(ToolError::msg)?;
+            ctx.session().notify_elicitation_complete("e1")?;
+            Ok::<_, ToolError>(format!("{:?}", res.action))
+        })
+        .tool(Tool::new("form", "Form elicitation"), |ctx, _args| async move {
+            let schema = json!({"type":"object","properties":{"name":{"type":"string"}}});
+            let res = ctx.elicit(types::ElicitParams::form("Name?", schema)).await.map_err(ToolError::msg)?;
+            Ok::<_, ToolError>(format!("{:?}", res.content))
+        })
+        .tool(Tool::new("needs_auth", "Requires a URL elicitation first"), |_ctx, _args| async move {
+            let elicitation = types::ElicitUrlParams {
+                message: "Authorize".into(),
+                elicitation_id: "e2".into(),
+                url: "https://example.com/auth".into(),
+            };
+            let error = jsonrpc::ErrorObject::url_elicitation_required("Authorize first", vec![elicitation]);
+            Err::<(), _>(ToolError::protocol(error))
+        })
+        .tool(Tool::new("sample_tools", "Sampling with tools"), |ctx, _args| async move {
+            let res = ctx
+                .create_message(CreateMessageParams {
+                    messages: vec![types::SamplingMessage::user("weather?")],
+                    max_tokens: 10,
+                    tools: Some(vec![Tool::new("get_weather", "Weather")]),
+                    tool_choice: Some(types::ToolChoice::required()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(ToolError::msg)?;
+            let names: Vec<_> = res.tool_uses().map(|t| t.name.clone()).collect();
+            Ok::<_, ToolError>(names.join(","))
+        })
+        .build()
+}
+
+#[tokio::test]
+async fn url_elicitation_round_trip() {
+    let server = elicit_server();
+    let mut c = Client::connect(&server);
+    c.init(json!({"elicitation": {"form": {}, "url": {}}})).await;
+
+    c.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"connect"}})).await;
+    let req = c.recv().await;
+    assert_eq!(req["method"], "elicitation/create");
+    assert_eq!(
+        req["params"],
+        json!({"mode":"url","message":"Connect your account","elicitationId":"e1","url":"https://example.com/connect?id=e1"})
+    );
+    c.send(json!({"jsonrpc":"2.0","id":req["id"],"result":{"action":"accept"}})).await;
+    let done = c.recv().await;
+    assert_eq!(
+        done,
+        json!({"jsonrpc":"2.0","method":"notifications/elicitation/complete","params":{"elicitationId":"e1"}})
+    );
+    let res = c.recv().await;
+    assert_eq!(res["id"], 1);
+    assert_eq!(res["result"]["content"][0]["text"], "Accept");
+
+    // Form mode still goes without `mode`.
+    c.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"form"}})).await;
+    let req = c.recv().await;
+    assert_eq!(req["method"], "elicitation/create");
+    assert!(req["params"].get("mode").is_none());
+    assert_eq!(req["params"]["message"], "Name?");
+    c.send(json!({"jsonrpc":"2.0","id":req["id"],"result":{"action":"accept","content":{"name":"Bob"}}})).await;
+    let res = c.recv().await;
+    assert!(res["result"]["content"][0]["text"].as_str().unwrap().contains("Bob"));
+
+    let err = c.call(3, "tools/call", json!({"name":"needs_auth"})).await;
+    assert_eq!(err["error"]["code"], -32042);
+    assert_eq!(err["error"]["data"]["elicitations"][0]["elicitationId"], "e2");
+    assert_eq!(err["error"]["data"]["elicitations"][0]["mode"], "url");
+}
+
+#[tokio::test]
+async fn elicitation_capability_checks() {
+    let server = elicit_server();
+
+    // `elicitation: {}` means form only.
+    let mut c = Client::connect(&server);
+    c.init(json!({"elicitation": {}})).await;
+    let res = c.call(1, "tools/call", json!({"name":"connect"})).await;
+    assert_eq!(res["result"]["isError"], true);
+    assert!(res["result"]["content"][0]["text"].as_str().unwrap().contains("URL elicitation"));
+    c.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"form"}})).await;
+    assert_eq!(c.recv().await["method"], "elicitation/create");
+
+    // URL only: form mode is refused.
+    let mut c = Client::connect(&server);
+    c.init(json!({"elicitation": {"url": {}}})).await;
+    let res = c.call(1, "tools/call", json!({"name":"form"})).await;
+    assert_eq!(res["result"]["isError"], true);
+
+    // No elicitation at all.
+    let mut c = Client::connect(&server);
+    c.init(json!({})).await;
+    let res = c.call(1, "tools/call", json!({"name":"connect"})).await;
+    assert_eq!(res["result"]["isError"], true);
+}
+
+#[tokio::test]
+async fn sampling_with_tools_capability() {
+    let server = elicit_server();
+
+    // Plain sampling isn't enough for a request with tools.
+    let mut c = Client::connect(&server);
+    c.init(json!({"sampling": {}})).await;
+    let res = c.call(1, "tools/call", json!({"name":"sample_tools"})).await;
+    assert_eq!(res["result"]["isError"], true);
+    assert!(res["result"]["content"][0]["text"].as_str().unwrap().contains("sampling with tools"));
+
+    let mut c = Client::connect(&server);
+    c.init(json!({"sampling": {"tools": {}}})).await;
+    c.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sample_tools"}})).await;
+    let req = c.recv().await;
+    assert_eq!(req["method"], "sampling/createMessage");
+    assert_eq!(req["params"]["tools"][0]["name"], "get_weather");
+    assert_eq!(req["params"]["toolChoice"], json!({"mode":"required"}));
+    c.send(json!({"jsonrpc":"2.0","id":req["id"],"result":{
+        "role":"assistant",
+        "content":[{"type":"tool_use","id":"c1","name":"get_weather","input":{"city":"Paris"}}],
+        "model":"m",
+        "stopReason":"toolUse"
+    }}))
+    .await;
+    let res = c.recv().await;
+    assert_eq!(res["id"], 2);
+    assert_eq!(res["result"]["content"][0]["text"], "get_weather");
 }

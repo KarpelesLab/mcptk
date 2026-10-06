@@ -293,16 +293,39 @@ impl Session {
         }
     }
 
-    /// Ask the client's LLM for a completion (sampling).
-    pub async fn create_message(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
+    fn require_sampling(&self, params: &CreateMessageParams) -> Result<()> {
         self.require("sampling", |c| c.sampling.is_some())?;
+        if params.uses_tools() {
+            self.require("sampling with tools", ClientCapabilities::supports_sampling_tools)?;
+        }
+        Ok(())
+    }
+
+    fn require_elicitation(&self, params: &ElicitParams) -> Result<()> {
+        match params {
+            ElicitParams::Form(_) => self.require("elicitation", ClientCapabilities::supports_elicitation_form),
+            ElicitParams::Url(_) => self.require("URL elicitation", ClientCapabilities::supports_elicitation_url),
+        }
+    }
+
+    /// Ask the client's LLM for a completion (sampling). Requests with tools
+    /// need the client's `sampling.tools` capability.
+    pub async fn create_message(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
+        self.require_sampling(&params)?;
         self.request_as(&self.inner.outlet, "sampling/createMessage", params).await
     }
 
-    /// Ask the user for input (elicitation).
+    /// Ask the user for input (elicitation). URL mode needs the client's
+    /// `elicitation.url` capability.
     pub async fn elicit(&self, params: ElicitParams) -> Result<ElicitResult> {
-        self.require("elicitation", |c| c.elicitation.is_some())?;
+        self.require_elicitation(&params)?;
         self.request_as(&self.inner.outlet, "elicitation/create", params).await
+    }
+
+    /// Tell the client the out-of-band interaction of a URL mode elicitation
+    /// finished (`notifications/elicitation/complete`).
+    pub fn notify_elicitation_complete(&self, elicitation_id: &str) -> Result<()> {
+        self.notify("notifications/elicitation/complete", Some(json!({ "elicitationId": elicitation_id })))
     }
 
     /// The client's roots (directories or files it lets the server work on).
@@ -542,15 +565,17 @@ impl RequestContext {
         self.session.request_via(&self.outlet, method, params).await
     }
 
-    /// Ask the client's LLM for a completion (sampling).
+    /// Ask the client's LLM for a completion (sampling). Requests with tools
+    /// need the client's `sampling.tools` capability.
     pub async fn create_message(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
-        self.session.require("sampling", |c| c.sampling.is_some())?;
+        self.session.require_sampling(&params)?;
         self.session.request_as(&self.outlet, "sampling/createMessage", params).await
     }
 
-    /// Ask the user for input (elicitation).
+    /// Ask the user for input (elicitation). URL mode needs the client's
+    /// `elicitation.url` capability.
     pub async fn elicit(&self, params: ElicitParams) -> Result<ElicitResult> {
-        self.session.require("elicitation", |c| c.elicitation.is_some())?;
+        self.session.require_elicitation(&params)?;
         self.session.request_as(&self.outlet, "elicitation/create", params).await
     }
 

@@ -80,13 +80,13 @@ impl IntoReadResult for ReadResourceResult {
 
 impl IntoReadResult for ResourceContents {
     fn into_read_result(self, _: &str, _: Option<&str>) -> ReadResourceResult {
-        ReadResourceResult { contents: vec![self] }
+        ReadResourceResult { contents: vec![self], meta: None }
     }
 }
 
 impl IntoReadResult for Vec<ResourceContents> {
     fn into_read_result(self, _: &str, _: Option<&str>) -> ReadResourceResult {
-        ReadResourceResult { contents: self }
+        ReadResourceResult { contents: self, meta: None }
     }
 }
 
@@ -115,7 +115,7 @@ impl IntoPromptResult for GetPromptResult {
 
 impl IntoPromptResult for Vec<PromptMessage> {
     fn into_prompt_result(self) -> GetPromptResult {
-        GetPromptResult { description: None, messages: self }
+        GetPromptResult { description: None, messages: self, meta: None }
     }
 }
 
