@@ -18,7 +18,8 @@ another MCP SDK.
 - **Transports**: stdio, any `AsyncRead`/`AsyncWrite` pair (unix sockets,
   pipes...), and Streamable HTTP (sessions, SSE or JSON responses, `GET`
   streams, origin checks, idle expiry). The HTTP handler can also be mounted
-  in your own hyper/axum server.
+  in your own hyper/axum server. WebSocket (`ws` feature) for Claude Code's
+  `"type": "ws"` servers, optionally on the same port and path as HTTP.
 - **Channels**: push events into a Claude Code session, and relay its
   permission prompts.
 
@@ -98,6 +99,33 @@ To mount it in your own server instead, call `StreamableHttp::handle(request)`
 from any hyper-compatible stack and use `.path(None)` if your router already
 matched the route.
 
+### WebSocket
+
+With the `ws` feature, each WebSocket connection is one MCP session, with one
+JSON-RPC message per text frame and the `mcp` subprotocol, as Claude Code's
+`"type": "ws"` servers and the TypeScript SDK's `WebSocketClientTransport`
+expect. The upgrade runs on hyper with the same origin checks as HTTP.
+
+```rust
+use mcptk::ws::WebSocketServer;
+
+WebSocketServer::new(server.clone())
+    .max_message_size(4 << 20)              // larger messages close the socket (1009)
+    .with_http(StreamableHttp::new(server)) // optional: HTTP on the same port and path
+    .serve("127.0.0.1:8080")                // ws://127.0.0.1:8080/mcp
+    .await?;
+```
+
+```json
+{ "mcpServers": { "events": { "type": "ws", "url": "ws://127.0.0.1:8080/mcp",
+  "headers": { "Authorization": "Bearer TOKEN" } } } }
+```
+
+Mount it in your own hyper/axum server with `WebSocketServer::handle(request)`
+(the connection must be served `with_upgrades()`), or serve an already
+upgraded `WebSocketStream` with `Server::connect_ws`. Authentication is up to
+you: check the request's headers before handing it over.
+
 ## Channels
 
 A channel is an MCP server, spawned by Claude Code over stdio, that pushes
@@ -162,6 +190,7 @@ Run one with `cargo run --example echo`.
 | --- | --- | --- |
 | `stdio` | yes | `serve_stdio` / `connect_stdio` (`connect_io` is always available) |
 | `http` | yes | the `http` module: Streamable HTTP server transport |
+| `ws` | no | the `ws` module: WebSocket server transport (`tokio-tungstenite`) |
 | `schemars` | yes | `typed_tool` and `Tool::output_schema_for`, with schemas derived from types |
 
 ## Not yet supported

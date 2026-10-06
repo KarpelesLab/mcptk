@@ -36,6 +36,8 @@ mod io;
 pub mod jsonrpc;
 pub mod server;
 pub mod types;
+#[cfg(feature = "ws")]
+pub mod ws;
 
 pub use channel::{Behavior, ChannelEvent, PermissionRequest, PermissionVerdict};
 pub use error::{Error, Result, ToolError};

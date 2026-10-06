@@ -11,8 +11,8 @@ use tokio::task::JoinHandle;
 
 /// A session served over a byte stream.
 pub struct Connection {
-    session: Session,
-    task: JoinHandle<Result<()>>,
+    pub(crate) session: Session,
+    pub(crate) task: JoinHandle<Result<()>>,
 }
 
 impl Connection {

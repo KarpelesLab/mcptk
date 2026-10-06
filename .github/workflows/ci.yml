@@ -28,10 +28,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
       - name: Feature combinations
         run: |
-          for f in "" stdio http schemars stdio,http; do
+          for f in "" stdio http schemars stdio,http ws http,ws; do
             cargo clippy --no-default-features --features "$f" -- -D warnings
           done
 
