@@ -61,6 +61,11 @@ pub(crate) struct SessionInner {
     next_id: AtomicI64,
     pending: Pending,
     running: Mutex<HashMap<RequestId, CancellationToken>>,
+    /// Signalled each time a request finishes.
+    finished: tokio::sync::Notify,
+    /// How many running requests are open `subscriptions/listen` streams,
+    /// which never finish on their own.
+    listening: std::sync::atomic::AtomicUsize,
     log_level: Mutex<LoggingLevel>,
     subscriptions: Mutex<HashSet<String>>,
     data: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
@@ -146,6 +151,8 @@ impl Session {
                 next_id: AtomicI64::new(1),
                 pending: Mutex::new(HashMap::new()),
                 running: Mutex::new(HashMap::new()),
+                finished: tokio::sync::Notify::new(),
+                listening: std::sync::atomic::AtomicUsize::new(0),
                 log_level: Mutex::new(LoggingLevel::Info),
                 subscriptions: Mutex::new(HashSet::new()),
                 data: Mutex::new(HashMap::new()),
@@ -202,6 +209,30 @@ impl Session {
         self.inner.pending.lock().unwrap().clear();
         self.inner.running.lock().unwrap().clear();
         self.inner.server.unregister_session(&self.inner.id);
+    }
+
+    /// The client stopped sending (end of input): let running requests
+    /// finish and answer, for at most `grace`. Requests waiting on the client
+    /// fail right away, since no answer can come.
+    pub(crate) async fn drain(&self, grace: std::time::Duration) {
+        self.inner.pending.lock().unwrap().clear();
+        let idle = async {
+            loop {
+                let finished = self.inner.finished.notified();
+                tokio::pin!(finished);
+                finished.as_mut().enable();
+                let listening = self.inner.listening.load(Ordering::Acquire);
+                if self.inner.running.lock().unwrap().len() <= listening {
+                    return;
+                }
+                finished.await;
+            }
+        };
+        tokio::select! {
+            _ = idle => {}
+            _ = tokio::time::sleep(grace) => {}
+            _ = self.closed() => {}
+        }
     }
 
     /// Store per-session state, replacing any value of the same type.
@@ -498,6 +529,7 @@ impl Session {
                     reply.send(Outbound::Done(id));
                 }
             }
+            session.inner.finished.notify_waiters();
         });
     }
 
@@ -541,6 +573,15 @@ impl Session {
         let server = &self.inner.server;
         let filter = stateless::honored(server, &params.notifications);
         let _guard = server.inner.listeners.add(server, self, ctx.id.clone(), filter, ctx.outlet.clone());
+        struct Listening<'a>(&'a SessionInner);
+        impl Drop for Listening<'_> {
+            fn drop(&mut self) {
+                self.0.listening.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.inner.listening.fetch_add(1, Ordering::AcqRel);
+        let _listening = Listening(&self.inner);
+        self.inner.finished.notify_waiters();
         std::future::pending().await
     }
 

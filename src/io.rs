@@ -9,6 +9,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+/// How long running requests get to finish once the input ends.
+const EOF_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A session served over a byte stream.
 pub struct Connection {
     pub(crate) session: Session,
@@ -32,7 +35,8 @@ impl Server {
     /// Serve one session over `reader`/`writer`, in the background.
     ///
     /// Messages are newline-delimited JSON. The session ends at the end of
-    /// input, on a write error, or when closed.
+    /// input (after giving running requests a few seconds to answer), on a
+    /// write error, or when closed.
     pub fn connect_io<R, W>(&self, reader: R, writer: W) -> Connection
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -46,6 +50,11 @@ impl Server {
             let (stop_tx, stop_rx) = oneshot::channel();
             let writer = tokio::spawn(write_loop(writer, rx, stop_rx, s.clone()));
             let read = read_loop(reader, &s, &outlet).await;
+            if read.is_ok() {
+                // End of input: requests already received still get their
+                // responses (think `cat requests.jsonl | server`).
+                s.drain(EOF_GRACE).await;
+            }
             s.close();
             let _ = stop_tx.send(());
             let write = writer.await.map_err(|e| Error::Other(format!("writer task failed: {e}")))?;

@@ -513,3 +513,35 @@ async fn sampling_with_tools_capability() {
     assert_eq!(res["id"], 2);
     assert_eq!(res["result"]["content"][0]["text"], "get_weather");
 }
+
+#[tokio::test]
+async fn end_of_input_lets_running_requests_answer() {
+    let server = Server::builder("drain", "1")
+        .tool(Tool::new("nap", "Sleeps briefly"), |_ctx, _args| async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok::<_, ToolError>("rested")
+        })
+        .build();
+    let (client_side, server_side) = tokio::io::duplex(1 << 16);
+    let (sr, sw) = tokio::io::split(server_side);
+    let conn = server.connect_io(sr, sw);
+    let (cr, mut cw) = tokio::io::split(client_side);
+    let input = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nap"}}),
+    ];
+    for msg in input {
+        cw.write_all(format!("{msg}\n").as_bytes()).await.unwrap();
+    }
+    // Like `cat requests | server`: the input ends while the tool runs.
+    cw.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), conn.wait()).await.expect("drained promptly").unwrap();
+    let mut lines = BufReader::new(cr).lines();
+    let mut last = Value::Null;
+    while let Some(line) = lines.next_line().await.unwrap() {
+        last = serde_json::from_str(&line).unwrap();
+    }
+    assert_eq!(last["id"], 2);
+    assert_eq!(last["result"]["content"][0]["text"], "rested");
+}
