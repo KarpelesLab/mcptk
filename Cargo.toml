@@ -59,3 +59,7 @@ required-features = ["http", "schemars"]
 [[example]]
 name = "ui_app"
 required-features = ["stdio", "schemars"]
+
+[[example]]
+name = "tasks"
+required-features = ["stdio", "schemars"]

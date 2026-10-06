@@ -2,6 +2,7 @@
 
 mod results;
 mod session;
+pub mod tasks;
 mod template;
 
 pub use results::{IntoPromptResult, IntoReadResult, IntoToolResult, Json};
@@ -71,6 +72,8 @@ struct Config {
     notifications: HashMap<String, NotificationFn>,
     on_initialized: Vec<SessionFn>,
     tool_filter: Option<ToolFilter>,
+    /// The tasks extension, when enabled (see the `tasks` module).
+    tasks: Option<Arc<tasks::TaskManager>>,
 }
 
 pub(crate) struct ServerInner {
@@ -503,6 +506,7 @@ impl ServerBuilder {
                 notifications: HashMap::new(),
                 on_initialized: Vec::new(),
                 tool_filter: None,
+                tasks: None,
             },
             tools: Vec::new(),
             resources: Vec::new(),

@@ -14,6 +14,8 @@ another MCP SDK.
   subscriptions, prompts, completions, logging, progress, cancellation,
   per-session tool filtering, and tools/resources/prompts you can add or
   remove at runtime (sessions get `list_changed`).
+- **Extensions**: [tasks](#tasks) (`io.modelcontextprotocol/tasks`):
+  long-running tool calls answered with a task handle the client polls.
 - **Requests to the client**: sampling, elicitation, roots, ping.
 - **Transports**: stdio, any `AsyncRead`/`AsyncWrite` pair (unix sockets,
   pipes...), and Streamable HTTP (sessions, SSE or JSON responses, `GET`
@@ -183,6 +185,59 @@ When mounting `handle` in your own router, route the paths from
 `ProtectedResource::metadata_paths()` to it too (it answers them whatever
 `.path` is), or serve `ProtectedResource::metadata_response()` yourself.
 
+## Tasks
+
+mcptk implements the server side of the official Tasks extension
+(`io.modelcontextprotocol/tasks`, protocol revision 2026-07-28, SEP-2663).
+A slow tool call can answer right away with a task handle
+(`resultType: "task"`). The client then polls `tasks/get` until the task is
+`completed`, `failed` or `cancelled`, answers its input requests with
+`tasks/update`, and can stop it with `tasks/cancel`.
+
+```rust
+use mcptk::tasks::{TaskConfig, TaskContext};
+
+Server::builder("jobs", "1.0")
+    .tasks(TaskConfig::new().ttl(Some(Duration::from_secs(600))))
+    .task_tool(Tool::new("crunch", "Crunch numbers"), |ctx: TaskContext, _args| async move {
+        ctx.progress(0.0, None, Some("warming up")).await?; // becomes the task's statusMessage
+        let answer = ctx.elicit(params).await?;             // becomes one of the task's inputRequests
+        Ok::<_, ToolError>("crunched")
+    })
+    .build()
+```
+
+- **The server decides which calls become tasks.** A call becomes a task when
+  the tool was registered with `task_tool` / `typed_task_tool` and the
+  request declares the extension in its own client capabilities
+  (`_meta["io.modelcontextprotocol/clientCapabilities"].extensions`).
+  Otherwise the handler runs inline like any tool. To refuse inline calls
+  instead (error `-32021`), use `.task_mode(name, TaskMode::Required)`.
+- **`TaskContext`** works in both modes. When the call is a task,
+  `elicit` / `create_message` / `list_roots` become `inputRequests` on the
+  task, and the handler resumes when `tasks/update` answers them. `progress`
+  and `set_status_message` update `statusMessage`. Log notifications are
+  dropped, since the extension doesn't support them on tasks. When the call
+  runs inline, these are ordinary client requests and notifications.
+- **Results.** A `ToolError::protocol` error ends the task as `failed`. Any
+  other result, including `isError` results, ends it as `completed`.
+  `tasks/cancel` drops the handler's future and the task ends as
+  `cancelled`.
+- **Storage.** Tasks live in a `TaskStore` owned by the `Server`, so a task
+  created over one HTTP request or session can be polled from another.
+  `InMemoryTaskStore` is the default. Implement the trait to store tasks
+  elsewhere. Running handlers stay in the process that started them.
+- **Expiry.** Each task expires `ttl` after it is created (one hour by
+  default). A task still running at that point is cancelled. After expiry,
+  the task is forgotten and `tasks/get` returns an error.
+- Task ids are 128-bit random values, and they are the only credential a
+  client needs to access a task.
+
+The server doesn't support the experimental tasks from 2025-11-25
+(`capabilities.tasks`, the `task` parameter, `tasks/result`, `tasks/list`).
+They aren't wire-compatible with the extension. Task status notifications
+(`notifications/tasks`) aren't sent either, so clients have to poll.
+
 ## Channels
 
 A channel is an MCP server, spawned by Claude Code over stdio, that pushes
@@ -282,6 +337,7 @@ See [`examples/ui_app.rs`](examples/ui_app.rs) for a complete app.
 | [`http_server`](examples/http_server.rs) | Streamable HTTP server with logging and resource subscriptions |
 | [`webhook_channel`](examples/webhook_channel.rs) | Two-way Claude Code channel with permission relay |
 | [`ui_app`](examples/ui_app.rs) | MCP App: a tool whose result renders as an interactive HTML view |
+| [`tasks`](examples/tasks.rs) | Tools that run as tasks (polling, input requests) for clients with the tasks extension |
 
 Run one with `cargo run --example echo`.
 

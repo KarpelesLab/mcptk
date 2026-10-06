@@ -458,7 +458,7 @@ impl Session {
         }
         match method {
             "tools/list" => to_value(ListToolsResult { tools: server.list_tools(self), next_cursor: None }),
-            "tools/call" => to_value(server.call_tool(ctx, parse(params)?).await?),
+            "tools/call" => server.route_tool_call(ctx, parse(params)?).await,
             "resources/list" => to_value(ListResourcesResult { resources: server.list_resources(), next_cursor: None }),
             "resources/templates/list" => to_value(ListResourceTemplatesResult {
                 resource_templates: server.list_resource_templates(),

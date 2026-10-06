@@ -44,7 +44,7 @@ pub mod ws;
 pub use channel::{Behavior, ChannelEvent, PermissionRequest, PermissionVerdict};
 pub use error::{Error, Result, ToolError};
 pub use io::Connection;
-pub use server::{Json, RequestContext, Server, ServerBuilder, Session};
+pub use server::{Json, RequestContext, Server, ServerBuilder, Session, tasks};
 pub use types::{
     CallToolResult, Content, LoggingLevel, Prompt, PromptMessage, Resource, ResourceContents, ResourceTemplate, Tool,
 };
