@@ -117,6 +117,26 @@ fn parse<T: DeserializeOwned>(params: Option<Value>) -> Result<T, ErrorObject> {
         .map_err(|e| ErrorObject::invalid_params(format!("invalid params: {e}")))
 }
 
+/// The page of `items` a list request asks for with its `cursor` (an offset,
+/// opaque to clients), and the cursor of the page after it.
+fn page<T>(
+    items: Vec<T>,
+    params: &Option<Value>,
+    size: Option<usize>,
+) -> Result<(Vec<T>, Option<String>), ErrorObject> {
+    let start = match params.as_ref().and_then(|p| p.get("cursor")) {
+        None | Some(Value::Null) => 0,
+        Some(cursor) => cursor
+            .as_str()
+            .and_then(|c| c.parse::<usize>().ok())
+            .filter(|start| *start <= items.len())
+            .ok_or_else(|| ErrorObject::invalid_params("invalid cursor"))?,
+    };
+    let end = start.saturating_add(size.unwrap_or(usize::MAX)).min(items.len());
+    let next = (end < items.len()).then(|| end.to_string());
+    Ok((items.into_iter().skip(start).take(end - start).collect(), next))
+}
+
 fn to_value<T: Serialize>(v: T) -> Result<Value, ErrorObject> {
     serde_json::to_value(v).map_err(|e| ErrorObject::internal(e.to_string()))
 }
@@ -643,7 +663,10 @@ impl Session {
             "ping" | "logging/setLevel" | "resources/subscribe" | "resources/unsubscribe" if is_stateless => {
                 Err(ErrorObject::method_not_found(method))
             }
-            "tools/list" => to_value(ListToolsResult { tools: server.list_tools(self), next_cursor: None }),
+            "tools/list" => {
+                let (tools, next_cursor) = page(server.list_tools(self), &params, server.page_size())?;
+                to_value(ListToolsResult { tools, next_cursor })
+            }
             "tools/call" => {
                 let p: CallToolParams = parse(params)?;
                 let run = |ctx| {
@@ -657,11 +680,15 @@ impl Session {
                 }
                 Ok(result)
             }
-            "resources/list" => to_value(ListResourcesResult { resources: server.list_resources(), next_cursor: None }),
-            "resources/templates/list" => to_value(ListResourceTemplatesResult {
-                resource_templates: server.list_resource_templates(),
-                next_cursor: None,
-            }),
+            "resources/list" => {
+                let (resources, next_cursor) = page(server.list_resources(), &params, server.page_size())?;
+                to_value(ListResourcesResult { resources, next_cursor })
+            }
+            "resources/templates/list" => {
+                let (resource_templates, next_cursor) =
+                    page(server.list_resource_templates(), &params, server.page_size())?;
+                to_value(ListResourceTemplatesResult { resource_templates, next_cursor })
+            }
             "resources/read" => {
                 let p: ReadResourceParams = parse(params)?;
                 let run = |ctx| {
@@ -680,7 +707,10 @@ impl Session {
                 self.inner.subscriptions.lock().unwrap().remove(&p.uri);
                 Ok(json!({}))
             }
-            "prompts/list" => to_value(ListPromptsResult { prompts: server.list_prompts(), next_cursor: None }),
+            "prompts/list" => {
+                let (prompts, next_cursor) = page(server.list_prompts(), &params, server.page_size())?;
+                to_value(ListPromptsResult { prompts, next_cursor })
+            }
             "prompts/get" => {
                 let p: GetPromptParams = parse(params)?;
                 let run = |ctx| {

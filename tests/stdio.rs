@@ -545,3 +545,35 @@ async fn end_of_input_lets_running_requests_answer() {
     assert_eq!(last["id"], 2);
     assert_eq!(last["result"]["content"][0]["text"], "rested");
 }
+
+#[tokio::test]
+async fn paginated_lists() {
+    let mut builder = Server::builder("pages", "1").page_size(2);
+    for name in ["a", "b", "c", "d", "e"] {
+        builder = builder.tool(Tool::new(name, "A tool"), |_ctx, _args| async move { Ok::<_, ToolError>("ok") });
+    }
+    let server = builder.build();
+    let mut c = Client::connect(&server);
+    c.init(json!({})).await;
+
+    let mut names = Vec::new();
+    let mut cursor = Value::Null;
+    let mut pages = 0;
+    loop {
+        let params = if cursor.is_null() { json!({}) } else { json!({ "cursor": cursor }) };
+        let res = c.call(10 + pages, "tools/list", params).await;
+        let tools = res["result"]["tools"].as_array().unwrap();
+        assert!(tools.len() <= 2);
+        names.extend(tools.iter().map(|t| t["name"].as_str().unwrap().to_string()));
+        pages += 1;
+        cursor = res["result"].get("nextCursor").cloned().unwrap_or_default();
+        if cursor.is_null() {
+            break;
+        }
+    }
+    assert_eq!(names, ["a", "b", "c", "d", "e"]);
+    assert_eq!(pages, 3);
+
+    let bad = c.call(99, "tools/list", json!({"cursor": "nonsense"})).await;
+    assert_eq!(bad["error"]["code"], -32602);
+}

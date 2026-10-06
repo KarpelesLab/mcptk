@@ -77,6 +77,7 @@ struct Config {
     /// The tasks extension, when enabled (see the `tasks` module).
     tasks: Option<Arc<tasks::TaskManager>>,
     cache_ttl: Duration,
+    page_size: Option<usize>,
     cache_scope: CacheScope,
 }
 
@@ -201,7 +202,7 @@ impl Server {
         Fut: Future<Output = Result<R, ToolError>> + Send + 'static,
         R: IntoToolResult,
     {
-        let tool = tool.input_schema(schema_for::<A>());
+        let tool = tool.input_schema(input_schema_for::<A>());
         self.insert_tool(ToolEntry { tool, handler: typed_tool_fn(handler) });
     }
 
@@ -303,6 +304,10 @@ impl Server {
         tools.iter().find(|e| e.tool.name == name).map(|e| e.tool.input_schema.clone())
     }
 
+    pub(crate) fn page_size(&self) -> Option<usize> {
+        self.inner.config.page_size
+    }
+
     pub(crate) fn list_resources(&self) -> Vec<Resource> {
         self.inner.resources.read().unwrap().iter().map(|e| e.resource.clone()).collect()
     }
@@ -390,6 +395,17 @@ pub(crate) fn schema_for<T: schemars::JsonSchema>() -> Value {
     let mut schema = serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| serde_json::json!({}));
     if let Value::Object(map) = &mut schema {
         map.remove("$schema");
+    }
+    schema
+}
+
+/// The schema of a tool's arguments, which must be an object schema: types
+/// whose schema says nothing of their type (such as enums of structs) get
+/// `"type": "object"`.
+#[cfg(feature = "schemars")]
+pub(crate) fn input_schema_for<T: schemars::JsonSchema>() -> Value {
+    let mut schema = schema_for::<T>();
+    if let Value::Object(map) = &mut schema {
         map.entry("type").or_insert_with(|| "object".into());
     }
     schema
@@ -523,6 +539,7 @@ impl ServerBuilder {
                 tool_filter: None,
                 tasks: None,
                 cache_ttl: Duration::ZERO,
+                page_size: None,
                 cache_scope: CacheScope::Public,
             },
             tools: Vec::new(),
@@ -580,6 +597,14 @@ impl ServerBuilder {
     /// still told about changes right away.
     pub fn cache_ttl(mut self, ttl: Duration) -> Self {
         self.config.cache_ttl = ttl;
+        self
+    }
+
+    /// Return list results (`tools/list`, `prompts/list`, `resources/list`,
+    /// `resources/templates/list`) in pages of at most `size` entries, with a
+    /// `nextCursor` to fetch the rest. By default, lists are returned whole.
+    pub fn page_size(mut self, size: usize) -> Self {
+        self.config.page_size = Some(size.max(1));
         self
     }
 
@@ -651,7 +676,7 @@ impl ServerBuilder {
         Fut: Future<Output = Result<R, ToolError>> + Send + 'static,
         R: IntoToolResult,
     {
-        let tool = tool.input_schema(schema_for::<A>());
+        let tool = tool.input_schema(input_schema_for::<A>());
         self.config.tools = true;
         self.tools.retain(|e| e.tool.name != tool.name);
         self.tools.push(Arc::new(ToolEntry { tool, handler: typed_tool_fn(handler) }));

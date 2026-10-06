@@ -14,8 +14,9 @@ another MCP SDK.
 - **Server features**: tools (raw or typed with JSON Schema derived by
   `schemars`, structured output), resources, resource templates and
   subscriptions, prompts, completions, logging, progress, cancellation,
-  per-session tool filtering, and tools/resources/prompts you can add or
-  remove at runtime (sessions get `list_changed`).
+  paginated lists (`page_size`), per-session tool filtering, and
+  tools/resources/prompts you can add or remove at runtime (sessions get
+  `list_changed`).
 - **Extensions**: [tasks](#tasks) (`io.modelcontextprotocol/tasks`):
   long-running tool calls answered with a task handle the client polls.
 - **Requests to the client**: sampling, elicitation, roots, ping.
@@ -414,7 +415,6 @@ Run one with `cargo run --example echo`.
 ## Not yet supported
 
 - Resuming HTTP streams with `Last-Event-ID`
-- Pagination cursors (lists are returned whole)
 
 ## License
 
