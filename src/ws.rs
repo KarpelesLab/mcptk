@@ -7,9 +7,9 @@
 //! speaks. Clients ask for the [`SUBPROTOCOL`] `mcp`, which the server
 //! echoes back.
 //!
-//! The HTTP upgrade runs on hyper, like [`StreamableHttp`](crate::http::StreamableHttp),
+//! The HTTP upgrade runs on hyper, like `StreamableHttp`,
 //! so the same `Origin` checks apply, and both can share a port and path:
-//! see [`WebSocketServer::with_http`].
+//! see `WebSocketServer::with_http`.
 //!
 //! ```no_run
 //! # async fn run(server: mcptk::Server) -> mcptk::Result<()> {
@@ -219,8 +219,8 @@ impl WebSocketServer {
     /// The request must come from hyper (or a framework on it, such as axum),
     /// whose connection is served `with_upgrades()`, so the upgraded socket
     /// can be taken from it. Other requests get an error response, or go to
-    /// the [`StreamableHttp`](crate::http::StreamableHttp) set with
-    /// [`with_http`](Self::with_http).
+    /// the `StreamableHttp` set with
+    /// `with_http`.
     pub async fn handle<B>(&self, req: Request<B>) -> Response<WsBody>
     where
         B: Body,
@@ -544,7 +544,7 @@ impl Body for WsBody {
 
 impl WsBody {
     /// Read the whole body (for tests and tools; don't use on an SSE
-    /// stream from [`WebSocketServer::with_http`], it may never end).
+    /// stream from `WebSocketServer::with_http`, it may never end).
     pub async fn collect_bytes(self) -> Bytes {
         match http_body_util::BodyExt::collect(self).await {
             Ok(c) => c.to_bytes(),

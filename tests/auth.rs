@@ -1,4 +1,5 @@
 //! Authorization (OAuth protected resource) tests over Streamable HTTP.
+#![cfg(feature = "http")]
 
 use ::http::{Request, StatusCode};
 use bytes::Bytes;

@@ -1,6 +1,7 @@
 //! Protocol revision 2026-07-28: stateless requests with per-request
 //! `_meta`, over a byte stream and over Streamable HTTP, alongside the
 //! handshake-based revisions.
+#![cfg(feature = "http")]
 
 use ::http::{Request, StatusCode};
 use bytes::Bytes;

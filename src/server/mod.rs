@@ -93,7 +93,7 @@ pub(crate) struct ServerInner {
 
 /// An MCP server: what it offers (tools, resources, prompts...) and its live
 /// sessions. Cheap to clone; serve it with a transport such as
-/// [`Server::serve_stdio`] or [`StreamableHttp`](crate::http::StreamableHttp).
+/// `Server::serve_stdio` or `StreamableHttp`.
 ///
 /// Tools, resources and prompts can be added and removed while serving;
 /// sessions are told their lists changed.

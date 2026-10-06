@@ -5,7 +5,7 @@
 //! server is a *resource server*: it does not issue tokens. An authorization
 //! server (your identity provider) does, and the MCP server only checks them.
 //!
-//! What mcptk does, once [`StreamableHttp::auth`](crate::http::StreamableHttp::auth)
+//! What mcptk does, once `StreamableHttp::auth`
 //! is given a [`ProtectedResource`]:
 //!
 //! - Serves the OAuth 2.0 Protected Resource Metadata document (RFC 9728) at
@@ -259,7 +259,7 @@ type ScopePolicy = Arc<dyn Fn(&crate::jsonrpc::Request) -> Vec<String> + Send + 
 
 /// How an MCP server is protected: its identity as an OAuth resource, its
 /// authorization servers, the scopes it wants, and the token validator.
-/// Give it to [`StreamableHttp::auth`](crate::http::StreamableHttp::auth).
+/// Give it to `StreamableHttp::auth`.
 #[derive(Clone)]
 pub struct ProtectedResource {
     resource: String,
@@ -415,7 +415,7 @@ impl ProtectedResource {
         &self.metadata_url
     }
 
-    /// The paths [`StreamableHttp::handle`](crate::http::StreamableHttp::handle)
+    /// The paths `StreamableHttp::handle`
     /// serves the metadata on: the one from [`metadata_location`](Self::metadata_location)
     /// (e.g. `/.well-known/oauth-protected-resource/mcp`) and the root one.
     /// Route them to the handler if you mount it in your own router.
@@ -506,7 +506,7 @@ pub(crate) fn current() -> Option<Arc<AuthInfo>> {
 
 impl RequestContext {
     /// Who the request is authenticated as: set when served over HTTP with
-    /// [`StreamableHttp::auth`](crate::http::StreamableHttp::auth). Each HTTP
+    /// `StreamableHttp::auth`. Each HTTP
     /// request is authenticated on its own, so this is per request, not per
     /// session.
     pub fn auth(&self) -> Option<&AuthInfo> {

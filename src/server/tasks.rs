@@ -8,7 +8,7 @@
 //! `tasks/cancel`.
 //!
 //! The server decides which calls become tasks. With mcptk, register a tool
-//! with [`ServerBuilder::task_tool`] (or [`ServerBuilder::typed_task_tool`]):
+//! with [`ServerBuilder::task_tool`] (or `ServerBuilder::typed_task_tool`):
 //! when the request declares the extension in its client capabilities
 //! (`_meta["io.modelcontextprotocol/clientCapabilities"].extensions`), the
 //! call is answered with a task and the handler runs in the background;

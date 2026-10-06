@@ -1,5 +1,6 @@
 //! End-to-end tests over an in-memory byte stream, as a stdio client would
 //! see the server.
+#![cfg(feature = "schemars")]
 
 use mcptk::types::{CompleteParams, Completion, CompletionRef, CreateMessageParams, LoggingLevel};
 use mcptk::*;

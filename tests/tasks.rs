@@ -1,5 +1,6 @@
 //! The tasks extension (`io.modelcontextprotocol/tasks`), end to end over an
 //! in-memory byte stream and over Streamable HTTP.
+#![cfg(feature = "http")]
 
 use mcptk::tasks::{EXTENSION_ID, TaskConfig, TaskContext, TaskMode};
 use mcptk::types::ElicitParams;

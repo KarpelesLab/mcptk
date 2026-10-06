@@ -9,38 +9,111 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test & lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-      - name: Feature combinations
-        run: |
-          for f in "" stdio http schemars stdio,http ws http,ws; do
-            cargo clippy --no-default-features --features "$f" -- -D warnings
-          done
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Format
+        if: runner.os == 'Linux' # formatting is platform-independent
+        run: cargo fmt --all --check
+
+      - name: Clippy (all features, warnings denied)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test (all features)
+        run: cargo test --all-features
+
+      - name: Test (default features)
+        run: cargo test
 
   msrv:
+    name: MSRV (Rust 1.89)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.89
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+
+      # Keep this pin in sync with `rust-version` in Cargo.toml. Compiling on
+      # the declared minimum guards against accidentally using a std/library or
+      # language feature newer than 1.89 (behavior itself is covered by the
+      # stable `test` jobs, so this is compile-only).
+      - name: Install Rust 1.89 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: cargo check --all-features --all-targets
+        run: cargo check --all-features --all-targets
+
+  docs:
+    name: Docs build (warnings denied)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --all-features
+
+  lean_features:
+    # Every other clippy/doc run here uses `--all-features`, which hides a whole
+    # class of breakage: code, tests or intra-doc links that only work when
+    # another feature happens to be on. Check-only, so it is cheap.
+    name: Lean feature checks
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lean
+
+      # Keep in sync with Cargo.toml's [features] when adding a feature.
+      - name: clippy + rustdoc, no features, then one feature at a time
+        run: |
+          set -euo pipefail
+          cargo clippy --no-default-features --all-targets -- -D warnings
+          cargo doc --no-deps --no-default-features
+          for f in stdio http ws schemars; do
+            echo "::group::$f"
+            cargo clippy --no-default-features --features "$f" --all-targets -- -D warnings
+            cargo doc --no-deps --no-default-features --features "$f"
+            echo "::endgroup::"
+          done

@@ -1,4 +1,5 @@
 //! Streamable HTTP transport tests.
+#![cfg(feature = "http")]
 
 use ::http::{Request, StatusCode};
 use bytes::Bytes;

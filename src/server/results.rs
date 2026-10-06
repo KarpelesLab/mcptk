@@ -46,7 +46,7 @@ impl IntoToolResult for () {
 
 /// Return a value as JSON: serialized as text content, and as
 /// `structuredContent` (pair it with
-/// [`Tool::output_schema_for`](crate::types::Tool::output_schema_for)).
+/// `Tool::output_schema_for`).
 ///
 /// Protocol 2026-07-28 allows any JSON value as `structuredContent`; older
 /// revisions only objects, so for those clients other values are sent as
