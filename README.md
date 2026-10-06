@@ -22,6 +22,8 @@ another MCP SDK.
   `"type": "ws"` servers, optionally on the same port and path as HTTP.
 - **Channels**: push events into a Claude Code session, and relay its
   permission prompts.
+- **MCP Apps**: serve interactive HTML views for tool results
+  (`io.modelcontextprotocol/ui`).
 
 Requires Rust 1.89+ (edition 2024).
 
@@ -174,6 +176,49 @@ While channels are in research preview, test custom channels with
 [`examples/webhook_channel.rs`](examples/webhook_channel.rs) for a complete
 two-way channel with a reply tool and permission relay.
 
+## MCP Apps
+
+[MCP Apps](https://github.com/modelcontextprotocol/ext-apps) (the
+`io.modelcontextprotocol/ui` extension, SEP-1865) let a tool's result render
+as an interactive HTML view in hosts that support it. The page is a `ui://`
+resource with the MIME type `text/html;profile=mcp-app`; a tool links to it
+with `_meta.ui.resourceUri`.
+
+```rust
+use mcptk::apps::{AppsBuilderExt, ToolUiExt, UiResource, UiSupport};
+
+let view = UiResource::new("ui://weather/view", "weather_view", include_str!("view.html"))
+    .connect_domain("https://api.weather.example") // CSP: fetch/XHR/WebSocket
+    .resource_domain("https://cdn.jsdelivr.net")   // CSP: scripts, styles, images, fonts
+    .prefers_border(true);
+
+Server::builder("weather", "1.0")
+    .ui_resource(view) // serves the page and declares the extension
+    .tool(Tool::new("forecast", "Show the forecast").ui_resource("ui://weather/view"), |ctx, args| async move {
+        // Text for the model and text-only hosts; structuredContent for the view.
+        Ok::<_, ToolError>(CallToolResult::text("Sunny, 22°C").structured(json!({"temp": 22})))
+    })
+    .tool(Tool::new("refresh", "Refresh the view").ui_resource("ui://weather/view").app_only(), refresh)
+    .tool_filter(mcptk::apps::hide_app_only_tools_without_ui)
+```
+
+- `app_only()` sets `_meta.ui.visibility: ["app"]`: the view can call the tool
+  (through the host) but the model doesn't see it. Hosts without MCP Apps
+  would list it anyway; `hide_app_only_tools_without_ui` hides it there.
+- `ctx.supports_ui()` tells whether the client declared the extension with
+  `text/html;profile=mcp-app`, from the request's per-call client
+  capabilities (2026-07-28) or the session's. Always return useful text too.
+- The view talks to the host over `postMessage` (`ui/initialize`,
+  `ui/notifications/tool-result`, `tools/call`...). The server only sees
+  ordinary `resources/read` and `tools/call` requests.
+- `openai_compat()` on tools and `UiResource` also emits the OpenAI Apps SDK
+  keys (`openai/outputTemplate`, `openai/widgetCSP`...). ChatGPT now reads
+  the standard keys, so this is only for older hosts.
+- Claude Code renders no views: it hides UI resources from `@` mentions and
+  its resource list, but reading one by URI works.
+
+See [`examples/ui_app.rs`](examples/ui_app.rs) for a complete app.
+
 ## Examples
 
 | Example | What it shows |
@@ -181,6 +226,7 @@ two-way channel with a reply tool and permission relay.
 | [`echo`](examples/echo.rs) | stdio server: typed tools, progress, structured output, resources, templates, prompts |
 | [`http_server`](examples/http_server.rs) | Streamable HTTP server with logging and resource subscriptions |
 | [`webhook_channel`](examples/webhook_channel.rs) | Two-way Claude Code channel with permission relay |
+| [`ui_app`](examples/ui_app.rs) | MCP App: a tool whose result renders as an interactive HTML view |
 
 Run one with `cargo run --example echo`.
 

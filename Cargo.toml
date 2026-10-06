@@ -55,3 +55,7 @@ required-features = ["stdio", "http"]
 [[example]]
 name = "http_server"
 required-features = ["http", "schemars"]
+
+[[example]]
+name = "ui_app"
+required-features = ["stdio", "schemars"]

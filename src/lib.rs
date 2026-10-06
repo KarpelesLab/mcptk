@@ -28,6 +28,7 @@
 //! }
 //! ```
 
+pub mod apps;
 pub mod channel;
 mod error;
 #[cfg(feature = "http")]
