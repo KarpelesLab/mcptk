@@ -62,6 +62,7 @@ struct Config {
     info: Implementation,
     instructions: Option<String>,
     experimental: JsonObject,
+    extensions: JsonObject,
     tools: bool,
     resources: bool,
     prompts: bool,
@@ -115,6 +116,7 @@ impl Server {
             prompts: if c.prompts { list_changed() } else { None },
             resources: c.resources.then_some(ResourcesCapability { subscribe: Some(true), list_changed: Some(true) }),
             tools: if c.tools { list_changed() } else { None },
+            extensions: (!c.extensions.is_empty()).then(|| c.extensions.clone()),
         }
     }
 
@@ -492,6 +494,7 @@ impl ServerBuilder {
                 info: Implementation::new(name, version),
                 instructions: None,
                 experimental: JsonObject::new(),
+                extensions: JsonObject::new(),
                 tools: false,
                 resources: false,
                 prompts: false,
@@ -539,6 +542,13 @@ impl ServerBuilder {
     /// Declare an experimental capability.
     pub fn experimental(mut self, name: impl Into<String>, value: Value) -> Self {
         self.config.experimental.insert(name.into(), value);
+        self
+    }
+
+    /// Declare support for a protocol extension (e.g.
+    /// `io.modelcontextprotocol/tasks`) with its settings object.
+    pub fn extension(mut self, id: impl Into<String>, settings: Value) -> Self {
+        self.config.extensions.insert(id.into(), settings);
         self
     }
 

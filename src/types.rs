@@ -92,6 +92,10 @@ pub struct ServerCapabilities {
     pub resources: Option<ResourcesCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ListChangedCapability>,
+    /// Optional protocol extensions (2026-07-28+), keyed by extension id such
+    /// as `io.modelcontextprotocol/tasks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<JsonObject>,
 }
 
 /// What a client offers.
@@ -106,6 +110,10 @@ pub struct ClientCapabilities {
     pub sampling: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elicitation: Option<Value>,
+    /// Optional protocol extensions (2026-07-28+), keyed by extension id such
+    /// as `io.modelcontextprotocol/tasks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<JsonObject>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -334,6 +342,12 @@ impl Tool {
         self.icons.get_or_insert_with(Vec::new).push(icon);
         self
     }
+
+    /// Set a `_meta` entry, for vendor keys such as `anthropic/alwaysLoad`.
+    pub fn meta(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.meta.get_or_insert_with(JsonObject::new).insert(key.into(), value.into());
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -437,6 +451,12 @@ impl Resource {
 
     pub fn size(mut self, size: u64) -> Self {
         self.size = Some(size);
+        self
+    }
+
+    /// Set a `_meta` entry.
+    pub fn meta(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.meta.get_or_insert_with(JsonObject::new).insert(key.into(), value.into());
         self
     }
 }
