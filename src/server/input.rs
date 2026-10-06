@@ -102,8 +102,9 @@ impl InputRequired {
     }
 
     /// The `input_required` result (without `_meta`).
-    pub(crate) fn into_result(self) -> Value {
+    pub(crate) fn into_result(mut self) -> Value {
         let mut result = json!({ "resultType": "input_required" });
+        self.input_requests.values_mut().for_each(for_stateless);
         if !self.input_requests.is_empty() {
             result["inputRequests"] = Value::Object(self.input_requests);
         }
@@ -111,6 +112,17 @@ impl InputRequired {
             result["requestState"] = state.into();
         }
         result
+    }
+}
+
+/// Adapt an input request (`{ "method", "params" }`) to 2026-07-28: URL
+/// mode elicitations lost their `elicitationId` there, as the client learns
+/// the outcome by retrying, not from a completion notification.
+pub(crate) fn for_stateless(request: &mut Value) {
+    if request["method"] == "elicitation/create"
+        && let Some(params) = request.get_mut("params").and_then(Value::as_object_mut)
+    {
+        params.remove("elicitationId");
     }
 }
 
@@ -198,6 +210,15 @@ mod tests {
         let third = InputState::new(json!({"mcptk-1": 2}).as_object().cloned(), ask.request_state);
         assert_eq!(third.next::<Value>("x", json!({})).unwrap(), json!({"roots": []}));
         assert_eq!(third.next::<i32>("x", json!({})).unwrap(), 2);
+    }
+
+    #[test]
+    fn url_elicitations_lose_their_id_on_stateless_requests() {
+        let ask = InputRequired::new().elicit("go", ElicitParams::url("Sign in", "https://example.com/in", "e1"));
+        assert_eq!(
+            ask.into_result()["inputRequests"]["go"],
+            json!({"method": "elicitation/create", "params": {"mode": "url", "message": "Sign in", "url": "https://example.com/in"}})
+        );
     }
 
     #[test]

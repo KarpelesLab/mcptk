@@ -244,8 +244,11 @@ Server::builder("jobs", "1.0")
 
 The server doesn't support the experimental tasks from 2025-11-25
 (`capabilities.tasks`, the `task` parameter, `tasks/result`, `tasks/list`).
-They aren't wire-compatible with the extension. Task status notifications
-(`notifications/tasks`) aren't sent either, so clients have to poll.
+They aren't wire-compatible with the extension.
+
+Clients can poll, or watch tasks: a `subscriptions/listen` request naming
+`taskIds` gets a `notifications/tasks` message with the task's new state each
+time it changes.
 
 ## Protocol 2026-07-28
 
@@ -412,7 +415,6 @@ Run one with `cargo run --example echo`.
 
 - Resuming HTTP streams with `Last-Event-ID`
 - Pagination cursors (lists are returned whole)
-- Task status notifications on `subscriptions/listen` (tasks extension)
 
 ## License
 

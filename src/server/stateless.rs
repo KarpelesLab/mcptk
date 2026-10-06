@@ -111,6 +111,8 @@ pub(crate) fn honored(server: &Server, requested: &SubscriptionFilter) -> Subscr
         prompts_list_changed: yes(requested.prompts_list_changed, c.prompts),
         resources_list_changed: yes(requested.resources_list_changed, c.resources),
         resource_subscriptions: requested.resource_subscriptions.clone().filter(|uris| c.resources && !uris.is_empty()),
+        // Filled in by the tasks extension, which checks access to each.
+        task_ids: None,
     }
 }
 
@@ -180,6 +182,17 @@ impl Listeners {
         outlet.send(Outbound::Message(Message::notification("notifications/subscriptions/acknowledged", Some(ack))));
         list.push(Arc::new(Listener { key, id, filter, outlet, session: Arc::downgrade(&session.inner) }));
         ListenerGuard { server: server.clone(), key }
+    }
+
+    /// Deliver a task's new state (`notifications/tasks`) to the listeners
+    /// watching it.
+    pub(crate) fn notify_task(&self, task_id: &str, task: &Value) {
+        let list = self.list.lock().unwrap();
+        for l in list.iter().filter(|l| l.filter.task_ids.iter().flatten().any(|id| id == task_id)) {
+            let mut params = task.clone();
+            params["_meta"] = json!({ META_SUBSCRIPTION_ID: l.id });
+            l.outlet.send(Outbound::Message(Message::notification("notifications/tasks", Some(params))));
+        }
     }
 
     /// Deliver a change notification to the listeners that asked for it

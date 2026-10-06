@@ -148,11 +148,17 @@ impl Task {
         self.expires_at().is_some_and(|t| t <= SystemTime::now())
     }
 
-    fn to_result(&self, result_type: &str) -> Result<Value, ErrorObject> {
+    /// The task as clients see it.
+    fn to_wire(&self) -> Result<Value, ErrorObject> {
         let mut v = serde_json::to_value(self).map_err(|e| ErrorObject::internal(e.to_string()))?;
         if let Value::Object(map) = &mut v {
             map.remove("owner");
         }
+        Ok(v)
+    }
+
+    fn to_result(&self, result_type: &str) -> Result<Value, ErrorObject> {
+        let mut v = self.to_wire()?;
         v["resultType"] = result_type.into();
         Ok(v)
     }
@@ -382,6 +388,18 @@ impl TaskManager {
         Ok(task)
     }
 
+    /// The tasks among `ids` that `ctx` may watch (they exist and belong
+    /// to it), for `subscriptions/listen`.
+    async fn watchable(&self, ctx: &RequestContext, ids: Vec<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        for id in ids {
+            if self.lookup(&id, "watch", Some(ctx)).await.is_ok() {
+                out.push(id);
+            }
+        }
+        out
+    }
+
     /// Create a task for a tool call, start it, and return the
     /// `CreateTaskResult`.
     async fn start(
@@ -413,6 +431,7 @@ impl TaskManager {
             id: task.task_id.clone(),
             state: tokio::sync::Mutex::new(task.clone()),
             store,
+            server: Arc::downgrade(&server.inner),
             cancel: CancellationToken::new(),
             inputs: Mutex::new(HashMap::new()),
             next_key: AtomicU64::new(1),
@@ -511,6 +530,8 @@ struct RunningTask {
     /// they happen in order.
     state: tokio::sync::Mutex<Task>,
     store: Arc<dyn TaskStore>,
+    /// To tell `subscriptions/listen` streams watching the task.
+    server: std::sync::Weak<super::ServerInner>,
     cancel: CancellationToken,
     /// Outstanding input requests, by key.
     inputs: Mutex<HashMap<String, oneshot::Sender<Value>>>,
@@ -526,7 +547,13 @@ impl RunningTask {
         }
         f(&mut task);
         task.last_updated_at = format_time(SystemTime::now());
-        self.store.put(task.clone()).await
+        self.store.put(task.clone()).await?;
+        if let Some(server) = self.server.upgrade()
+            && let Ok(wire) = task.to_wire()
+        {
+            server.listeners.notify_task(&self.id, &wire);
+        }
+        Ok(())
     }
 
     /// The task ran out of time: make it terminal (so nothing stores it
@@ -560,7 +587,8 @@ impl RunningTask {
         let key = format!("input-{}", self.next_key.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         self.inputs.lock().unwrap().insert(key.clone(), tx);
-        let request = json!({ "method": method, "params": params });
+        let mut request = json!({ "method": method, "params": params });
+        super::input::for_stateless(&mut request);
         let stored = self
             .update(|t| {
                 t.status = TaskStatus::InputRequired;
@@ -995,6 +1023,15 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(d) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+impl Server {
+    /// The part of a `subscriptions/listen` request's `taskIds` to honor.
+    pub(crate) async fn watchable_tasks(&self, ctx: &RequestContext, ids: Option<Vec<String>>) -> Option<Vec<String>> {
+        let manager = self.inner.config.tasks.as_ref()?;
+        let ids = manager.watchable(ctx, ids?).await;
+        (!ids.is_empty()).then_some(ids)
+    }
 }
 
 #[cfg(test)]

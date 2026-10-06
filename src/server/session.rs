@@ -571,7 +571,8 @@ impl Session {
     /// notifications until it is cancelled (it never completes otherwise).
     async fn listen(&self, ctx: &RequestContext, params: ListenParams) -> Result<Value, ErrorObject> {
         let server = &self.inner.server;
-        let filter = stateless::honored(server, &params.notifications);
+        let mut filter = stateless::honored(server, &params.notifications);
+        filter.task_ids = server.watchable_tasks(ctx, params.notifications.task_ids).await;
         let _guard = server.inner.listeners.add(server, self, ctx.id.clone(), filter, ctx.outlet.clone());
         struct Listening<'a>(&'a SessionInner);
         impl Drop for Listening<'_> {

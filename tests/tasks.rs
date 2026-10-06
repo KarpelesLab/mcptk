@@ -535,3 +535,35 @@ mod http {
         assert!(status.get("owner").is_none());
     }
 }
+
+#[tokio::test]
+async fn status_notifications_on_listen_streams() {
+    let f = fixture(TaskConfig::new());
+    let mut c = Client::connect(&f.server).await;
+    let id = c.start("gated").await;
+
+    // Watch the task (and one that doesn't exist, which isn't honored).
+    c.send(json!({"jsonrpc":"2.0","id":"watch","method":"subscriptions/listen","params":{
+        "notifications": {"taskIds": [id, "no-such-task"]},
+        "_meta": caps()
+    }}))
+    .await;
+    let mut next = async || -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(5), c.lines.next_line()).await.unwrap().unwrap().unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    let ack = next().await;
+    assert_eq!(ack["method"], "notifications/subscriptions/acknowledged", "{ack}");
+    assert_eq!(ack["params"]["notifications"], json!({"taskIds": [id]}));
+
+    // The task finishes: its new state is pushed, tagged with the stream.
+    f.gate.add_permits(1);
+    let update = next().await;
+    assert_eq!(update["method"], "notifications/tasks", "{update}");
+    let p = &update["params"];
+    assert_eq!(p["taskId"], id);
+    assert_eq!(p["status"], "completed");
+    assert_eq!(p["result"]["content"][0]["text"], "done (task: true)");
+    assert_eq!(p["_meta"]["io.modelcontextprotocol/subscriptionId"], "watch");
+    assert!(p.get("owner").is_none());
+}

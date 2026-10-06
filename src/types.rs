@@ -233,6 +233,10 @@ pub struct SubscriptionFilter {
     /// URIs to receive `notifications/resources/updated` for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_subscriptions: Option<Vec<String>>,
+    /// Tasks to receive `notifications/tasks` status updates for (tasks
+    /// extension).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ids: Option<Vec<String>>,
 }
 
 /// `subscriptions/listen` parameters.
@@ -1148,7 +1152,9 @@ pub struct ElicitFormParams {
 #[serde(rename_all = "camelCase", tag = "mode", rename = "url")]
 pub struct ElicitUrlParams {
     pub message: String,
-    /// Identifies the elicitation, in `notifications/elicitation/complete`.
+    /// Identifies the elicitation, in `notifications/elicitation/complete`
+    /// (2025-11-25). Not sent to 2026-07-28 clients, which learn the outcome
+    /// by retrying the request: keep what you need in the request state.
     pub elicitation_id: String,
     pub url: String,
 }
